@@ -1,0 +1,16 @@
+name: finmentsOLE
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ipykernel
+  - requests
+  - openpyxl
+  - pip
+  - pip:
+    - plotly
+    - streamlit
+    - beautifulsoup4 
+    - lxml
+    - yfinance
