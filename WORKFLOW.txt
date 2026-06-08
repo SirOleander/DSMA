@@ -1,0 +1,44 @@
+----------------------------------------
+WORKFLOW
+----------------------------------------
+
+This file is a quick step-by-step guide to start working on the marketing intelligence analyst project.
+Follow the steps from top to bottom to avoid setup errors and save progress consistently.
+GitHub Token: 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
+
+1. Open Terminal
+- MAC: Command + Space -> Terminal
+- WINDOWS: Start Menue -> Anaconda Prompt
+
+2. Go to project
+- WINDOWS: cd C:\Users\fynne\University\Data Science and Marketing Analytics
+
+3. Check Git status
+git status
+
+4. Pull latest changes from GitHub
+git pull
+
+5. Activate environment
+conda activate dsma
+
+6. Open in VS Code
+code .
+
+7. Run coding session 
+[====   ]
+
+8. Check changed files
+git status
+
+9. Add changed files
+git add .
+
+10. Commit changes
+git commit -m "Describe what you changed"
+
+11. Push to GitHub
+git push
+
+12. Optional: check clean state
+git status
