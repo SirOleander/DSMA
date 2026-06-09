@@ -1,12 +1,10 @@
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
 from config import PROCESSED_DATA_DIR
 
 
-SAMPLE_SIZE = 2_000_000
+SAMPLE_SIZE = 3_000_000
 RANDOM_STATE = 42
 
 
@@ -23,6 +21,139 @@ def load_processed_tables() -> dict:
 
     return tables
 
+
+def format_clean_table(df: pd.DataFrame) -> str:
+    """
+    Format a DataFrame as a clean, uniformly left-aligned text table.
+    """
+    if df.empty:
+        return "No data available."
+
+    formatted_df = df.copy()
+
+    for col in formatted_df.columns:
+        if pd.api.types.is_float_dtype(formatted_df[col]):
+            formatted_df[col] = formatted_df[col].map(lambda x: f"{x:.2f}")
+        else:
+            formatted_df[col] = formatted_df[col].astype(str)
+
+    column_widths = {}
+
+    for col in formatted_df.columns:
+        max_content_width = formatted_df[col].map(len).max()
+        column_widths[col] = max(len(col), max_content_width)
+
+    header = "  ".join(
+        col.ljust(column_widths[col])
+        for col in formatted_df.columns
+    )
+
+    separator = "  ".join(
+        "-" * column_widths[col]
+        for col in formatted_df.columns
+    )
+
+    rows = []
+
+    for _, row in formatted_df.iterrows():
+        rows.append(
+            "  ".join(
+                str(row[col]).ljust(column_widths[col])
+                for col in formatted_df.columns
+            )
+        )
+
+    return "\n".join([header, separator] + rows)
+
+
+def print_section_header(title: str) -> None:
+    """
+    Print a clear section header.
+    """
+    line = "=" * 100
+    print("\n" + line)
+    print(title.upper())
+    print(line)
+
+
+def print_subsection_header(title: str) -> None:
+    """
+    Print a clear subsection header.
+    """
+    print("\n" + "-" * 100)
+    print(title.upper())
+    print("-" * 100)
+
+
+def print_table_and_variable_overview(
+    tables: dict,
+    title: str
+) -> None:
+    """
+    Print table-level and variable-level overview for a dictionary of DataFrames.
+
+    The output is uniformly left-aligned and variables are grouped by table.
+    """
+    print_section_header(title)
+
+    table_overview = pd.DataFrame([
+        {
+            "table": table_name,
+            "rows": df.shape[0],
+            "columns": df.shape[1],
+        }
+        for table_name, df in tables.items()
+    ])
+
+    print_subsection_header("Table overview")
+    print(format_clean_table(table_overview))
+
+    print_subsection_header("Variable overview")
+
+    for table_name, df in tables.items():
+        print("\n" + f"[{table_name}]")
+
+        variable_rows = []
+
+        for col in df.columns:
+            variable_rows.append({
+                "variable": col,
+                "dtype": str(df[col].dtype),
+                "missing_values": df[col].isna().sum(),
+                "missing_percent": round(df[col].isna().mean() * 100, 2),
+                "unique_values": df[col].nunique(dropna=True),
+            })
+
+        variable_overview = pd.DataFrame(variable_rows)
+
+        print(format_clean_table(variable_overview))
+
+def print_variable_overview_only(
+    df: pd.DataFrame,
+    title: str,
+    table_name: str
+) -> None:
+    """
+    Print only the variable-level overview for a single DataFrame.
+    """
+    print_section_header(title)
+
+    print("\n" + f"[{table_name}]")
+
+    variable_rows = []
+
+    for col in df.columns:
+        variable_rows.append({
+            "variable": col,
+            "dtype": str(df[col].dtype),
+            "missing_values": df[col].isna().sum(),
+            "missing_percent": round(df[col].isna().mean() * 100, 2),
+            "unique_values": df[col].nunique(dropna=True),
+        })
+
+    variable_overview = pd.DataFrame(variable_rows)
+
+    print(format_clean_table(variable_overview))
 
 def prepare_core_tables(
     business: pd.DataFrame,
@@ -61,6 +192,87 @@ def prepare_core_tables(
     return business, reviews, users
 
 
+def select_columns_before_merge(
+    business: pd.DataFrame,
+    reviews: pd.DataFrame,
+    users: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Keep only relevant columns before merging.
+
+    This reduces memory usage and runtime because unused columns are not repeated
+    across millions of review rows.
+    """
+
+    reviews = reviews.copy()
+
+    if "review_text" in reviews.columns:
+        reviews["review_text_length"] = reviews["review_text"].fillna("").str.len()
+        reviews = reviews.drop(columns=["review_text"])
+
+    business_columns = [
+        "business_id",
+        "business_stars",
+        "business_review_count",
+        "is_open",
+        "city",
+        "state",
+        "latitude",
+        "longitude",
+        "attributes.RestaurantsPriceRange2",
+        "attributes.BusinessAcceptsCreditCards",
+        "attributes.RestaurantsTakeOut",
+        "attributes.RestaurantsDelivery",
+        "attributes.OutdoorSeating",
+        "attributes.BikeParking",
+        "attributes.GoodForKids",
+        "attributes.RestaurantsReservations",
+        "attributes.Alcohol",
+        "attributes.WiFi",
+        "attributes.HasTV",
+        "attributes.NoiseLevel",
+        "attributes.RestaurantsGoodForGroups",
+        "attributes.RestaurantsTableService",
+    ]
+
+    review_columns = [
+        "review_id",
+        "business_id",
+        "user_id",
+        "satisfied",
+        "review_stars",
+        "review_date",
+        "review_text_length",
+        "review_useful",
+        "review_funny",
+        "review_cool",
+    ]
+
+    user_columns = [
+        "user_id",
+        "user_review_count",
+        "user_average_stars",
+        "user_fans",
+        "user_useful",
+        "user_funny",
+        "user_cool",
+    ]
+
+    business = business[
+        [col for col in business_columns if col in business.columns]
+    ].copy()
+
+    reviews = reviews[
+        [col for col in review_columns if col in reviews.columns]
+    ].copy()
+
+    users = users[
+        [col for col in user_columns if col in users.columns]
+    ].copy()
+
+    return business, reviews, users
+
+
 def sample_reviews(reviews: pd.DataFrame) -> pd.DataFrame:
     """Sample reviews before merging to keep processing manageable."""
     sample_n = min(SAMPLE_SIZE, len(reviews))
@@ -69,8 +281,6 @@ def sample_reviews(reviews: pd.DataFrame) -> pd.DataFrame:
         n=sample_n,
         random_state=RANDOM_STATE
     ).copy()
-
-    print(f"Review sample created: {review_sample.shape}")
 
     return review_sample
 
@@ -139,15 +349,11 @@ def merge_tables(
         how="left"
     )
 
-    print(f"After business merge: {dataset.shape}")
-
     dataset = dataset.merge(
         users,
         on="user_id",
         how="left"
     )
-
-    print(f"After user merge: {dataset.shape}")
 
     dataset = dataset.merge(
         checkin_features,
@@ -167,10 +373,7 @@ def merge_tables(
         how="left"
     )
 
-    print(f"After activity merges: {dataset.shape}")
-
     return dataset
-
 
 def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
     """Clean obvious missing values and create simple derived variables."""
@@ -203,6 +406,12 @@ def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
         "attributes.BikeParking",
         "attributes.GoodForKids",
         "attributes.RestaurantsReservations",
+        "attributes.Alcohol",
+        "attributes.WiFi",
+        "attributes.HasTV",
+        "attributes.NoiseLevel",
+        "attributes.RestaurantsGoodForGroups",
+        "attributes.RestaurantsTableService",
     ]
 
     for col in categorical_columns:
@@ -219,10 +428,6 @@ def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
         dataset["review_year"] = dataset["review_date"].dt.year
         dataset["review_month"] = dataset["review_date"].dt.month
         dataset["review_weekday"] = dataset["review_date"].dt.dayofweek
-
-    if "review_text" in dataset.columns:
-        dataset["review_text_length"] = dataset["review_text"].fillna("").str.len()
-        dataset["review_word_count"] = dataset["review_text"].fillna("").str.split().str.len()
 
     return dataset
 
@@ -246,7 +451,6 @@ def add_log_features(dataset: pd.DataFrame) -> pd.DataFrame:
         "review_funny",
         "review_cool",
         "review_text_length",
-        "review_word_count",
     ]
 
     for col in log_candidates:
@@ -274,7 +478,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
 
         # Review-level variables
         "review_text_length",
-        "review_word_count",
         "review_useful",
         "review_funny",
         "review_cool",
@@ -282,7 +485,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "log_review_funny",
         "log_review_cool",
         "log_review_text_length",
-        "log_review_word_count",
         "review_year",
         "review_month",
         "review_weekday",
@@ -304,6 +506,12 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "attributes.BikeParking",
         "attributes.GoodForKids",
         "attributes.RestaurantsReservations",
+        "attributes.Alcohol",
+        "attributes.WiFi",
+        "attributes.HasTV",
+        "attributes.NoiseLevel",
+        "attributes.RestaurantsGoodForGroups",
+        "attributes.RestaurantsTableService",
 
         # User-level variables
         "user_review_count",
@@ -343,7 +551,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
 
     return dataset[available_columns].copy()
 
-
 def save_outputs(model_data: pd.DataFrame) -> None:
     """Save processed sample dataset."""
     output_pkl = PROCESSED_DATA_DIR / f"restaurant_model_sample_{SAMPLE_SIZE // 1000}k.pkl"
@@ -351,10 +558,6 @@ def save_outputs(model_data: pd.DataFrame) -> None:
 
     model_data.to_pickle(output_pkl)
     model_data.to_csv(output_csv, index=False)
-
-    print(f"\nSaved pkl: {output_pkl}")
-    print(f"Saved csv: {output_csv}")
-
 
 def main() -> None:
     print("Loading processed tables...")
@@ -367,23 +570,44 @@ def main() -> None:
     tip = tables["tip"]
     photo = tables["photo"]
 
-    print("Preparing core tables...")
     business, reviews, users = prepare_core_tables(
         business=business,
         reviews=reviews,
         users=users
     )
 
-    print("\nTarget distribution in full restaurant reviews:")
-    print(reviews["satisfied"].value_counts(normalize=True).round(3))
+    print_table_and_variable_overview(
+        tables={
+            "business": business,
+            "reviews": reviews,
+            "users": users,
+            "checkin_raw": checkin,
+            "tip_raw": tip,
+            "photo_raw": photo,
+        },
+        title="INITIAL DATASET"
+    )
 
-    print("\nSampling reviews...")
+    business, reviews, users = select_columns_before_merge(
+        business=business,
+        reviews=reviews,
+        users=users
+    )
+
     review_sample = sample_reviews(reviews)
 
-    print("\nCreating activity features...")
     checkin_features = create_checkin_features(checkin)
     tip_features = create_tip_features(tip)
     photo_features = create_photo_features(photo)
+
+    print_table_and_variable_overview(
+        tables={
+            "checkin_features": checkin_features,
+            "tip_features": tip_features,
+            "photo_features": photo_features,
+        },
+        title="NEW VARIABLES AFTER AGGREGATION"
+    )
 
     print("\nMerging tables...")
     dataset = merge_tables(
@@ -404,14 +628,16 @@ def main() -> None:
     print("\nSelecting final columns...")
     model_data = select_model_columns(dataset)
 
-    print("\nProcessing completed.")
-    print(f"Final dataset shape: {model_data.shape}")
+    print_variable_overview_only(
+        df=model_data,
+        title="FINAL VARIABLES FOR EDA AND MODELING",
+        table_name="final_eda_dataset"
+    )
 
-    print("\nTarget distribution in final sample:")
-    print(model_data["satisfied"].value_counts(normalize=True).round(3))
-
+    print("\nSaving model data...")
     save_outputs(model_data)
 
+    print("\nProcessing completed.")
 
 if __name__ == "__main__":
     main()
