@@ -35,52 +35,127 @@ TOP_CITIES = [
     {
         "city": "Philadelphia",
         "state": "PA",
-        "station": "GHCND:USW00013739",
+        "station": "USW00013739",
     },
     {
         "city": "New Orleans",
         "state": "LA",
-        "station": "GHCND:USW00012916",
+        "station": "USW00012916",
     },
     {
         "city": "Nashville",
         "state": "TN",
-        "station": "GHCND:USW00013897",
+        "station": "USW00013897",
     },
     {
         "city": "Tampa",
         "state": "FL",
-        "station": "GHCND:USW00012842",
+        "station": "USW00012842",
     },
     {
         "city": "Indianapolis",
         "state": "IN",
-        "station": "GHCND:USW00093819",
+        "station": "USW00093819",
     },
     {
         "city": "Tucson",
         "state": "AZ",
-        "station": "GHCND:USW00023160",
-    },
-    {
-        "city": "Reno",
-        "state": "NV",
-        "station": "GHCND:USW00023185",
+        "station": "USW00023160",
     },
     {
         "city": "Saint Louis",
         "state": "MO",
-        "station": "GHCND:USW00013994",
+        "station": "USW00013994",
+    },
+    {
+        "city": "Reno",
+        "state": "NV",
+        "station": "USW00023185",
     },
     {
         "city": "Santa Barbara",
         "state": "CA",
-        "station": "GHCND:USW00023190",
+        "station": "USW00023190",
+    },
+    {
+        "city": "Saint Petersburg",
+        "state": "FL",
+        "station": "USW00012842",
     },
     {
         "city": "Boise",
         "state": "ID",
-        "station": "GHCND:USW00024131",
+        "station": "USW00024131",
+    },
+    {
+        "city": "Edmonton",
+        "state": "AB",
+        "station": "CA001073420",
+    },
+    {
+        "city": "Clearwater",
+        "state": "FL",
+        "station": "USW00012842",
+    },
+    {
+        "city": "Metairie",
+        "state": "LA",
+        "station": "USW00012916",
+    },
+    {
+        "city": "Sparks",
+        "state": "NV",
+        "station": "USW00023185",
+    },
+    {
+        "city": "Franklin",
+        "state": "TN",
+        "station": "USW00013897",
+    },
+    {
+        "city": "Wilmington",
+        "state": "DE",
+        "station": "USW00013781",
+    },
+    {
+        "city": "Brandon",
+        "state": "FL",
+        "station": "USW00012842",
+    },
+    {
+        "city": "Carmel",
+        "state": "IN",
+        "station": "USW00093819",
+    },
+    {
+        "city": "Saint Pete Beach",
+        "state": "FL",
+        "station": "USW00012842",
+    },
+    {
+        "city": "Goleta",
+        "state": "CA",
+        "station": "USW00023190",
+    },
+    {
+        "city": "Cherry Hill",
+        "state": "NJ",
+        "station": "USW00013739",
+    },
+    {
+        "city": "Meridian",
+        "state": "ID",
+        "station": "USW00024131",
+    },
+    {
+        "city": "King of Prussia",
+        "state": "PA",
+        "station": "USW00013739",
+    },
+    {
+        "city": "Dunedin",
+        "state": "FL",
+        "station": "USW00012842",
     },
 ]
 

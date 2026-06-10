@@ -1,170 +1,107 @@
-from pathlib import Path
-
-import matplotlib.pyplot as plt
 import pandas as pd
 
 from config import PROCESSED_DATA_DIR
 
 
-SAMPLE_SIZE = 2_000_000
+SAMPLE_SIZE = 3_000_000
 
 DATA_FILE = PROCESSED_DATA_DIR / f"restaurant_model_sample_{SAMPLE_SIZE // 1000}k.pkl"
-
-PROJECT_DIR = Path(__file__).resolve().parent
-FIGURE_DIR = PROJECT_DIR / "outputs" / "figures"
-FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_FILE = PROCESSED_DATA_DIR / "unique_city_names.xlsx"
 
 
 def load_data() -> pd.DataFrame:
-    df = pd.read_pickle(DATA_FILE)
-    print(f"Loaded data: {df.shape}")
-    return df
+    """Load processed Yelp restaurant dataset."""
+    return pd.read_pickle(DATA_FILE)
 
 
-def save_plot(filename: str) -> None:
-    output_path = FIGURE_DIR / filename
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved: {output_path}")
+def create_city_overview(df: pd.DataFrame) -> pd.DataFrame:
+    """Create overview of unique city-state combinations."""
 
-
-def plot_target_distribution(df: pd.DataFrame) -> None:
-    target_counts = df["satisfied"].value_counts().sort_index()
-    target_counts.index = ["Not satisfied", "Satisfied"]
-
-    plt.figure(figsize=(7, 5))
-    target_counts.plot(kind="bar")
-    plt.title("Distribution of Customer Satisfaction")
-    plt.xlabel("Satisfaction Class")
-    plt.ylabel("Number of Reviews")
-    plt.xticks(rotation=0)
-
-    save_plot("01_target_distribution.png")
-
-
-def plot_review_star_distribution(df: pd.DataFrame) -> None:
-    star_counts = df["review_stars"].value_counts().sort_index()
-
-    plt.figure(figsize=(7, 5))
-    star_counts.plot(kind="bar")
-    plt.title("Distribution of Review Stars")
-    plt.xlabel("Review Stars")
-    plt.ylabel("Number of Reviews")
-    plt.xticks(rotation=0)
-
-    save_plot("02_review_star_distribution.png")
-
-
-def plot_top_cities(df: pd.DataFrame) -> None:
-    top_cities = df["city"].value_counts().head(10).sort_values()
-
-    plt.figure(figsize=(8, 6))
-    top_cities.plot(kind="barh")
-    plt.title("Top 10 Cities by Number of Restaurant Reviews")
-    plt.xlabel("Number of Reviews")
-    plt.ylabel("City")
-
-    save_plot("03_top_10_cities.png")
-
-
-def plot_top_states(df: pd.DataFrame) -> None:
-    top_states = df["state"].value_counts().head(10).sort_values()
-
-    plt.figure(figsize=(8, 6))
-    top_states.plot(kind="barh")
-    plt.title("Top 10 States by Number of Restaurant Reviews")
-    plt.xlabel("Number of Reviews")
-    plt.ylabel("State")
-
-    save_plot("04_top_10_states.png")
-
-
-def plot_satisfaction_by_category(
-    df: pd.DataFrame,
-    column: str,
-    title: str,
-    filename: str
-) -> None:
-    summary = (
-        df.groupby(column)["satisfied"]
-        .mean()
-        .sort_values()
-        * 100
+    city_overview = (
+        df.groupby(["city", "state"])
+        .size()
+        .reset_index(name="review_count")
+        .sort_values(["state", "city"])
+        .reset_index(drop=True)
     )
 
-    plt.figure(figsize=(8, 5))
-    summary.plot(kind="barh")
-    plt.title(title)
-    plt.xlabel("Satisfaction Rate (%)")
-    plt.ylabel(column)
+    total_reviews = city_overview["review_count"].sum()
 
-    save_plot(filename)
+    city_overview["review_share_percent"] = (
+        city_overview["review_count"] / total_reviews * 100
+    ).round(3)
 
+    city_overview_by_count = city_overview.sort_values(
+        "review_count",
+        ascending=False
+    ).reset_index(drop=True)
 
-def plot_correlation_with_target(df: pd.DataFrame) -> None:
-    numeric_df = df.select_dtypes(include="number").copy()
+    city_overview_by_count["rank"] = city_overview_by_count.index + 1
 
-    columns_to_drop = [
-        "satisfied",
-        "review_stars"
+    city_overview_by_count["cumulative_review_count"] = (
+        city_overview_by_count["review_count"].cumsum()
+    )
+
+    city_overview_by_count["cumulative_share_percent"] = (
+        city_overview_by_count["cumulative_review_count"] / total_reviews * 100
+    ).round(2)
+
+    city_overview_by_count = city_overview_by_count[
+        [
+            "rank",
+            "city",
+            "state",
+            "review_count",
+            "review_share_percent",
+            "cumulative_review_count",
+            "cumulative_share_percent",
+        ]
     ]
 
-    numeric_df = numeric_df.drop(columns=columns_to_drop, errors="ignore")
+    return city_overview_by_count
 
-    correlations = (
-        numeric_df
-        .corrwith(df["satisfied"])
-        .sort_values()
-    )
 
-    selected_correlations = pd.concat([
-        correlations.head(10),
-        correlations.tail(10)
-    ])
+def export_to_excel(city_overview: pd.DataFrame) -> None:
+    """Export city overview to Excel."""
 
-    plt.figure(figsize=(9, 7))
-    selected_correlations.plot(kind="barh")
-    plt.title("Numeric Correlations with Satisfaction")
-    plt.xlabel("Correlation with Satisfaction")
-    plt.ylabel("Variable")
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        city_overview.to_excel(
+            writer,
+            sheet_name="unique_cities",
+            index=False
+        )
 
-    save_plot("08_correlation_with_satisfaction.png")
+        workbook = writer.book
+        worksheet = writer.sheets["unique_cities"]
+
+        worksheet.freeze_panes = "A2"
+
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells:
+                if cell.value is not None:
+                    max_length = max(max_length, len(str(cell.value)))
+
+            worksheet.column_dimensions[column_letter].width = min(max_length + 2, 35)
+
+        worksheet.auto_filter.ref = worksheet.dimensions
 
 
 def main() -> None:
+    print("Loading processed Yelp dataset...")
     df = load_data()
 
-    plot_target_distribution(df)
-    plot_review_star_distribution(df)
-    plot_top_cities(df)
-    plot_top_states(df)
+    city_overview = create_city_overview(df)
 
-    plot_satisfaction_by_category(
-        df=df,
-        column="attributes.RestaurantsPriceRange2",
-        title="Satisfaction Rate by Restaurant Price Range",
-        filename="05_satisfaction_by_price_range.png"
-    )
+    print("\nTop 50 city-state combinations by review count:")
+    print(city_overview.head(50).to_string(index=False))
 
-    plot_satisfaction_by_category(
-        df=df,
-        column="attributes.OutdoorSeating",
-        title="Satisfaction Rate by Outdoor Seating",
-        filename="06_satisfaction_by_outdoor_seating.png"
-    )
+    export_to_excel(city_overview)
 
-    plot_satisfaction_by_category(
-        df=df,
-        column="attributes.RestaurantsDelivery",
-        title="Satisfaction Rate by Delivery Availability",
-        filename="07_satisfaction_by_delivery.png"
-    )
-
-    plot_correlation_with_target(df)
-
-    print("\nEDA plots completed.")
-    print(f"Figures saved to: {FIGURE_DIR}")
+    print(f"\nExported unique city overview to: {OUTPUT_FILE}")
+    print(f"Number of unique city-state combinations: {len(city_overview)}")
 
 
 if __name__ == "__main__":
