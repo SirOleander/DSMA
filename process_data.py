@@ -1,10 +1,9 @@
 import numpy as np
 import pandas as pd
 
-from config import PROCESSED_DATA_DIR
+from config import PROCESSED_DATA_DIR, SAMPLE_SIZE, YELP_SAMPLE_PKL, YELP_SAMPLE_CSV
 
 
-SAMPLE_SIZE = 3_000_000
 RANDOM_STATE = 42
 
 
@@ -85,6 +84,25 @@ def print_subsection_header(title: str) -> None:
     print("-" * 100)
 
 
+def build_variable_overview(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a variable-level overview (dtype, missing values, unique values)
+    for a single DataFrame.
+    """
+    variable_rows = [
+        {
+            "variable": col,
+            "dtype": str(df[col].dtype),
+            "missing_values": df[col].isna().sum(),
+            "missing_percent": round(df[col].isna().mean() * 100, 2),
+            "unique_values": df[col].nunique(dropna=True),
+        }
+        for col in df.columns
+    ]
+
+    return pd.DataFrame(variable_rows)
+
+
 def print_table_and_variable_overview(
     tables: dict,
     title: str
@@ -112,21 +130,7 @@ def print_table_and_variable_overview(
 
     for table_name, df in tables.items():
         print("\n" + f"[{table_name}]")
-
-        variable_rows = []
-
-        for col in df.columns:
-            variable_rows.append({
-                "variable": col,
-                "dtype": str(df[col].dtype),
-                "missing_values": df[col].isna().sum(),
-                "missing_percent": round(df[col].isna().mean() * 100, 2),
-                "unique_values": df[col].nunique(dropna=True),
-            })
-
-        variable_overview = pd.DataFrame(variable_rows)
-
-        print(format_clean_table(variable_overview))
+        print(format_clean_table(build_variable_overview(df)))
 
 def print_variable_overview_only(
     df: pd.DataFrame,
@@ -139,21 +143,7 @@ def print_variable_overview_only(
     print_section_header(title)
 
     print("\n" + f"[{table_name}]")
-
-    variable_rows = []
-
-    for col in df.columns:
-        variable_rows.append({
-            "variable": col,
-            "dtype": str(df[col].dtype),
-            "missing_values": df[col].isna().sum(),
-            "missing_percent": round(df[col].isna().mean() * 100, 2),
-            "unique_values": df[col].nunique(dropna=True),
-        })
-
-    variable_overview = pd.DataFrame(variable_rows)
-
-    print(format_clean_table(variable_overview))
+    print(format_clean_table(build_variable_overview(df)))
 
 def prepare_core_tables(
     business: pd.DataFrame,
@@ -801,6 +791,7 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "review_year",
         "review_month",
         "review_weekday",
+        "review_date",
 
         # Business-level variables
         "business_stars",
@@ -866,11 +857,8 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
 
 def save_outputs(model_data: pd.DataFrame) -> None:
     """Save processed sample dataset."""
-    output_pkl = PROCESSED_DATA_DIR / f"restaurant_model_sample_{SAMPLE_SIZE // 1000}k.pkl"
-    output_csv = PROCESSED_DATA_DIR / f"restaurant_model_sample_{SAMPLE_SIZE // 1000}k.csv"
-
-    model_data.to_pickle(output_pkl)
-    model_data.to_csv(output_csv, index=False)
+    model_data.to_pickle(YELP_SAMPLE_PKL)
+    model_data.to_csv(YELP_SAMPLE_CSV, index=False)
 
 def main() -> None:
     print("Loading processed tables...")

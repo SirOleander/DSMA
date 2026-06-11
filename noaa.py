@@ -5,18 +5,19 @@ import numpy as np
 import pandas as pd
 import requests
 
-from config import PROCESSED_DATA_DIR, DATA_DIR
+from config import (
+    EXTERNAL_DATA_DIR,
+    YELP_SAMPLE_PKL,
+    WEATHER_RAW_CSV,
+    WEATHER_CLEAN_CSV,
+)
 
 
-SAMPLE_SIZE = 3_000_000
-
-YELP_DATA_FILE = PROCESSED_DATA_DIR / f"restaurant_model_sample_{SAMPLE_SIZE // 1000}k.pkl"
-
-EXTERNAL_DATA_DIR = DATA_DIR / "external"
 EXTERNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-RAW_WEATHER_OUTPUT = EXTERNAL_DATA_DIR / "noaa_weather_raw_top_cities.csv"
-CLEAN_WEATHER_OUTPUT = EXTERNAL_DATA_DIR / "noaa_weather_daily_top_cities.csv"
+YELP_DATA_FILE = YELP_SAMPLE_PKL
+RAW_WEATHER_OUTPUT = WEATHER_RAW_CSV
+CLEAN_WEATHER_OUTPUT = WEATHER_CLEAN_CSV
 
 
 NOAA_ENDPOINT = "https://www.ncei.noaa.gov/access/services/data/v1"
@@ -27,7 +28,6 @@ WEATHER_VARIABLES = [
     "SNWD",  # snow depth
     "TMAX",  # maximum temperature
     "TMIN",  # minimum temperature
-    "TOBS",  # observed temperature
 ]
 
 
@@ -80,7 +80,7 @@ TOP_CITIES = [
     {
         "city": "Saint Petersburg",
         "state": "FL",
-        "station": "USW00012842",
+        "station": "USW00092806",
     },
     {
         "city": "Boise",
@@ -90,7 +90,7 @@ TOP_CITIES = [
     {
         "city": "Edmonton",
         "state": "AB",
-        "station": "CA001073420",
+        "station": "CA003012209",
     },
     {
         "city": "Clearwater",
@@ -162,20 +162,15 @@ TOP_CITIES = [
 
 def load_yelp_data() -> pd.DataFrame:
     """Load processed Yelp dataset."""
-    df = pd.read_pickle(YELP_DATA_FILE)
-    df["review_date"] = pd.to_datetime(df["review_year"].astype(str) + "-" +
-                                       df["review_month"].astype(str) + "-01",
-                                       errors="coerce")
-
-    return df
+    return pd.read_pickle(YELP_DATA_FILE)
 
 
 def get_review_date_range(df: pd.DataFrame) -> tuple[str, str]:
     """
-    Get approximate date range from processed Yelp data.
+    Get the calendar-year range covered by the processed Yelp data.
 
-    Since the final processed dataset currently keeps year/month/weekday but not
-    the original review date, we use the available year range here.
+    We download whole years (Jan 1 to Dec 31) spanning the observed review
+    years so that every exact review date can find a matching weather day.
     """
     min_year = int(df["review_year"].min())
     max_year = int(df["review_year"].max())
@@ -286,7 +281,6 @@ def clean_weather_data(weather: pd.DataFrame) -> pd.DataFrame:
         "SNWD": "weather_snow_depth",
         "TMAX": "weather_tmax",
         "TMIN": "weather_tmin",
-        "TOBS": "weather_tobs",
     }
 
     weather = weather.rename(columns=rename_map)
@@ -323,7 +317,6 @@ def clean_weather_data(weather: pd.DataFrame) -> pd.DataFrame:
         "weather_snow_depth",
         "weather_tmax",
         "weather_tmin",
-        "weather_tobs",
         "weather_temp_range",
         "is_rainy",
         "is_snowy",
