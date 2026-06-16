@@ -92,5 +92,7 @@ def main() -> None:
 
     print("Raw data loading completed.")
     print(summary_df)
+
+
 if __name__ == "__main__":
     main()

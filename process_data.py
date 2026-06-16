@@ -1,10 +1,100 @@
 import numpy as np
 import pandas as pd
 
-from config import PROCESSED_DATA_DIR, SAMPLE_SIZE, YELP_SAMPLE_PKL, YELP_SAMPLE_CSV
+from config import (
+    PROCESSED_DATA_DIR,
+    SAMPLE_SIZE,
+    YELP_SAMPLE_PKL,
+    YELP_SAMPLE_CSV,
+    WRITE_FULL_CSV_OUTPUTS,
+)
+from reporting import (
+    print_section,
+    print_subsection,
+    print_table,
+    build_variable_overview,
+    build_numeric_distribution_overview,
+    build_negative_value_check,
+    build_log_skewness_comparison,
+)
 
 
 RANDOM_STATE = 42
+
+# Set False for a lean production run (skips the diagnostic tables but keeps
+# all data transformations). Set True while exploring / writing the report.
+VERBOSE = True
+
+# String / categorical columns. Single source of truth used both for the
+# "Unknown" cleaning step and for the category-dtype memory optimisation.
+CATEGORICAL_COLUMNS = [
+    "city",
+    "state",
+    "attributes.RestaurantsPriceRange2",
+    "attributes.BusinessAcceptsCreditCards",
+    "attributes.RestaurantsTakeOut",
+    "attributes.RestaurantsDelivery",
+    "attributes.OutdoorSeating",
+    "attributes.BikeParking",
+    "attributes.GoodForKids",
+    "attributes.RestaurantsReservations",
+    "attributes.Alcohol",
+    "attributes.WiFi",
+    "attributes.HasTV",
+    "attributes.NoiseLevel",
+    "attributes.RestaurantsGoodForGroups",
+    "attributes.RestaurantsTableService",
+]
+
+# Count columns whose missing values genuinely mean "no record" -> fill with 0.
+COUNT_COLUMNS = [
+    "checkin_count",
+    "tip_count",
+    "tip_compliment_count",
+    "photo_count",
+    "photo_drink",
+    "photo_food",
+    "photo_inside",
+    "photo_menu",
+    "photo_outside",
+]
+
+# Columns that should never be negative (used by the data-quality diagnostic).
+NON_NEGATIVE_COLUMNS = [
+    "review_useful",
+    "review_funny",
+    "review_cool",
+    "business_review_count",
+    "user_review_count",
+    "user_fans",
+    "user_useful",
+    "user_funny",
+    "user_cool",
+    "checkin_count",
+    "tip_count",
+    "tip_compliment_count",
+    "photo_count",
+    "photo_food",
+    "photo_drink",
+    "photo_menu",
+    "photo_inside",
+    "photo_outside",
+    "review_text_length",
+]
+
+# Variables excluded from the pre-log skewness diagnostic: the target, the
+# star-based leakage variables, date parts, and coordinates.
+SKEW_EXCLUDE_COLUMNS = [
+    "satisfied",
+    "review_stars",
+    "business_stars",
+    "user_average_stars",
+    "review_year",
+    "review_month",
+    "review_weekday",
+    "latitude",
+    "longitude",
+]
 
 
 def load_processed_tables() -> dict:
@@ -20,130 +110,6 @@ def load_processed_tables() -> dict:
 
     return tables
 
-
-def format_clean_table(df: pd.DataFrame) -> str:
-    """
-    Format a DataFrame as a clean, uniformly left-aligned text table.
-    """
-    if df.empty:
-        return "No data available."
-
-    formatted_df = df.copy()
-
-    for col in formatted_df.columns:
-        if pd.api.types.is_float_dtype(formatted_df[col]):
-            formatted_df[col] = formatted_df[col].map(lambda x: f"{x:.2f}")
-        else:
-            formatted_df[col] = formatted_df[col].astype(str)
-
-    column_widths = {}
-
-    for col in formatted_df.columns:
-        max_content_width = formatted_df[col].map(len).max()
-        column_widths[col] = max(len(col), max_content_width)
-
-    header = "  ".join(
-        col.ljust(column_widths[col])
-        for col in formatted_df.columns
-    )
-
-    separator = "  ".join(
-        "-" * column_widths[col]
-        for col in formatted_df.columns
-    )
-
-    rows = []
-
-    for _, row in formatted_df.iterrows():
-        rows.append(
-            "  ".join(
-                str(row[col]).ljust(column_widths[col])
-                for col in formatted_df.columns
-            )
-        )
-
-    return "\n".join([header, separator] + rows)
-
-
-def print_section_header(title: str) -> None:
-    """
-    Print a clear section header.
-    """
-    line = "=" * 100
-    print("\n" + line)
-    print(title.upper())
-    print(line)
-
-
-def print_subsection_header(title: str) -> None:
-    """
-    Print a clear subsection header.
-    """
-    print("\n" + "-" * 100)
-    print(title.upper())
-    print("-" * 100)
-
-
-def build_variable_overview(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build a variable-level overview (dtype, missing values, unique values)
-    for a single DataFrame.
-    """
-    variable_rows = [
-        {
-            "variable": col,
-            "dtype": str(df[col].dtype),
-            "missing_values": df[col].isna().sum(),
-            "missing_percent": round(df[col].isna().mean() * 100, 2),
-            "unique_values": df[col].nunique(dropna=True),
-        }
-        for col in df.columns
-    ]
-
-    return pd.DataFrame(variable_rows)
-
-
-def print_table_and_variable_overview(
-    tables: dict,
-    title: str
-) -> None:
-    """
-    Print table-level and variable-level overview for a dictionary of DataFrames.
-
-    The output is uniformly left-aligned and variables are grouped by table.
-    """
-    print_section_header(title)
-
-    table_overview = pd.DataFrame([
-        {
-            "table": table_name,
-            "rows": df.shape[0],
-            "columns": df.shape[1],
-        }
-        for table_name, df in tables.items()
-    ])
-
-    print_subsection_header("Table overview")
-    print(format_clean_table(table_overview))
-
-    print_subsection_header("Variable overview")
-
-    for table_name, df in tables.items():
-        print("\n" + f"[{table_name}]")
-        print(format_clean_table(build_variable_overview(df)))
-
-def print_variable_overview_only(
-    df: pd.DataFrame,
-    title: str,
-    table_name: str
-) -> None:
-    """
-    Print only the variable-level overview for a single DataFrame.
-    """
-    print_section_header(title)
-
-    print("\n" + f"[{table_name}]")
-    print(format_clean_table(build_variable_overview(df)))
 
 def prepare_core_tables(
     business: pd.DataFrame,
@@ -264,15 +230,16 @@ def select_columns_before_merge(
 
 
 def sample_reviews(reviews: pd.DataFrame) -> pd.DataFrame:
-    """Sample reviews before merging to keep processing manageable."""
-    sample_n = min(SAMPLE_SIZE, len(reviews))
+    """
+    Sample reviews before merging to keep processing manageable.
 
-    review_sample = reviews.sample(
-        n=sample_n,
-        random_state=RANDOM_STATE
-    ).copy()
+    When SAMPLE_SIZE covers the whole table (the current setting), we return
+    the data as-is instead of shuffling several million rows for no reason.
+    """
+    if SAMPLE_SIZE >= len(reviews):
+        return reviews.copy()
 
-    return review_sample
+    return reviews.sample(n=SAMPLE_SIZE, random_state=RANDOM_STATE).copy()
 
 
 def create_checkin_features(checkin: pd.DataFrame) -> pd.DataFrame:
@@ -369,42 +336,11 @@ def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
     """Clean obvious missing values and create simple derived variables."""
     dataset = dataset.copy()
 
-    count_columns = [
-        "checkin_count",
-        "tip_count",
-        "tip_compliment_count",
-        "photo_count",
-        "photo_drink",
-        "photo_food",
-        "photo_inside",
-        "photo_menu",
-        "photo_outside",
-    ]
-
-    for col in count_columns:
+    for col in COUNT_COLUMNS:
         if col in dataset.columns:
             dataset[col] = dataset[col].fillna(0)
 
-    categorical_columns = [
-        "city",
-        "state",
-        "attributes.RestaurantsPriceRange2",
-        "attributes.BusinessAcceptsCreditCards",
-        "attributes.RestaurantsTakeOut",
-        "attributes.RestaurantsDelivery",
-        "attributes.OutdoorSeating",
-        "attributes.BikeParking",
-        "attributes.GoodForKids",
-        "attributes.RestaurantsReservations",
-        "attributes.Alcohol",
-        "attributes.WiFi",
-        "attributes.HasTV",
-        "attributes.NoiseLevel",
-        "attributes.RestaurantsGoodForGroups",
-        "attributes.RestaurantsTableService",
-    ]
-
-    for col in categorical_columns:
+    for col in CATEGORICAL_COLUMNS:
         if col in dataset.columns:
             dataset[col] = (
                 dataset[col]
@@ -418,6 +354,17 @@ def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
         dataset["review_year"] = dataset["review_date"].dt.year
         dataset["review_month"] = dataset["review_date"].dt.month
         dataset["review_weekday"] = dataset["review_date"].dt.dayofweek
+    
+    review_vote_columns = [
+        "review_useful",
+        "review_funny",
+        "review_cool",
+    ]
+
+    for col in review_vote_columns:
+        if col in dataset.columns:
+            dataset[col] = pd.to_numeric(dataset[col], errors="coerce")
+            dataset[col] = dataset[col].clip(lower=0)
 
     return dataset
 
@@ -735,21 +682,34 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
 
     return dataset
 
+
 def add_log_features(dataset: pd.DataFrame) -> pd.DataFrame:
-    """Add log-transformed versions of skewed count variables."""
+    """Add log-transformed versions of skewed non-negative count variables."""
     dataset = dataset.copy()
 
     log_candidates = [
+        # Business activity / popularity
         "business_review_count",
+
+        # User activity / history
         "user_review_count",
         "user_useful",
         "user_funny",
         "user_cool",
         "user_fans",
+
+        # Business engagement / activity
         "checkin_count",
         "tip_count",
         "tip_compliment_count",
         "photo_count",
+        "photo_food",
+        "photo_drink",
+        "photo_menu",
+        "photo_inside",
+        "photo_outside",
+
+        # Review-level behavior
         "review_useful",
         "review_funny",
         "review_cool",
@@ -758,8 +718,12 @@ def add_log_features(dataset: pd.DataFrame) -> pd.DataFrame:
 
     for col in log_candidates:
         if col in dataset.columns:
-            dataset[col] = pd.to_numeric(dataset[col], errors="coerce")
-            dataset[f"log_{col}"] = np.log1p(dataset[col].fillna(0).clip(lower=0))
+            values = pd.to_numeric(dataset[col], errors="coerce")
+            # log1p of the non-negative value. Missing values stay NaN on
+            # purpose: imputation is deferred to the modelling pipeline so it
+            # can be fit on training data only. Genuine count columns have
+            # already been 0-filled in clean_values(), so their logs are 0.
+            dataset[f"log_{col}"] = np.log1p(values.clip(lower=0))
 
     return dataset
 
@@ -776,7 +740,11 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         # Target
         "satisfied",
 
-        # Keep for EDA, but do not use as model input later
+        # LEAKAGE WARNING: keep for EDA only, exclude from modelling.
+        # review_stars: the target is derived directly from it.
+        # business_stars / user_average_stars (below): all-time averages that
+        # already include this review's rating, so they leak the target and are
+        # also temporal leakage. See config.LEAKAGE_COLS.
         "review_stars",
 
         # Review-level variables
@@ -844,6 +812,11 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "log_tip_count",
         "log_tip_compliment_count",
         "log_photo_count",
+        "log_photo_food",
+        "log_photo_drink",
+        "log_photo_menu",
+        "log_photo_inside",
+        "log_photo_outside",
     ]
 
     available_columns = [col for col in model_columns if col in dataset.columns]
@@ -855,12 +828,42 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
 
     return dataset[available_columns].copy()
 
-def save_outputs(model_data: pd.DataFrame) -> None:
-    """Save processed sample dataset."""
-    model_data.to_pickle(YELP_SAMPLE_PKL)
-    model_data.to_csv(YELP_SAMPLE_CSV, index=False)
+def optimize_dtypes(dataset: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reduce memory use without changing any values.
 
-def main() -> None:
+    - Known string/attribute columns become 'category'.
+    - Integer-valued numeric columns with no missing values are downcast to the
+      smallest safe integer type. Columns containing NaN (e.g. the 7 unmatched
+      users) or genuine floats (star ratings, log features) are left untouched.
+    """
+    dataset = dataset.copy()
+
+    for col in CATEGORICAL_COLUMNS:
+        if col in dataset.columns:
+            dataset[col] = dataset[col].astype("category")
+
+    for col in dataset.select_dtypes(include="number").columns:
+        values = dataset[col]
+        if values.isna().any():
+            continue
+        if (values == values.round()).all():
+            dataset[col] = pd.to_numeric(values, downcast="integer")
+
+    return dataset
+
+
+def save_outputs(model_data: pd.DataFrame) -> None:
+    """Save processed sample dataset (pickle always; CSV only if enabled)."""
+    model_data.to_pickle(YELP_SAMPLE_PKL)
+    print(f"Saved pickle: {YELP_SAMPLE_PKL}")
+
+    if WRITE_FULL_CSV_OUTPUTS:
+        model_data.to_csv(YELP_SAMPLE_CSV, index=False)
+        print(f"Saved CSV:    {YELP_SAMPLE_CSV}")
+
+
+def main(verbose: bool = VERBOSE) -> None:
     print("Loading processed tables...")
     tables = load_processed_tables()
 
@@ -874,25 +877,27 @@ def main() -> None:
     business, reviews, users = prepare_core_tables(
         business=business,
         reviews=reviews,
-        users=users
+        users=users,
     )
 
-    print_table_and_variable_overview(
-        tables={
+    if verbose:
+        print_section("INITIAL DATASET")
+        initial_tables = {
             "business": business,
             "reviews": reviews,
             "users": users,
             "checkin_raw": checkin,
             "tip_raw": tip,
             "photo_raw": photo,
-        },
-        title="INITIAL DATASET"
-    )
+        }
+        for name, frame in initial_tables.items():
+            print_subsection(f"[{name}] variable overview")
+            print_table(build_variable_overview(frame))
 
     business, reviews, users = select_columns_before_merge(
         business=business,
         reviews=reviews,
-        users=users
+        users=users,
     )
 
     review_sample = sample_reviews(reviews)
@@ -901,14 +906,16 @@ def main() -> None:
     tip_features = create_tip_features(tip)
     photo_features = create_photo_features(photo)
 
-    print_table_and_variable_overview(
-        tables={
+    if verbose:
+        print_section("NEW VARIABLES AFTER AGGREGATION")
+        aggregated_tables = {
             "checkin_features": checkin_features,
             "tip_features": tip_features,
             "photo_features": photo_features,
-        },
-        title="NEW VARIABLES AFTER AGGREGATION"
-    )
+        }
+        for name, frame in aggregated_tables.items():
+            print_subsection(f"[{name}] variable overview")
+            print_table(build_variable_overview(frame))
 
     print("\nMerging tables...")
     dataset = merge_tables(
@@ -922,25 +929,44 @@ def main() -> None:
 
     print("\nCleaning values...")
     dataset = clean_values(dataset)
-    
     dataset = standardize_city_names(dataset)
-    
+
+    if verbose:
+        print_section("NEGATIVE VALUE CHECK")
+        print_table(build_negative_value_check(dataset, NON_NEGATIVE_COLUMNS))
+
+        print_section("NUMERIC DISTRIBUTION AND SKEWNESS BEFORE LOG FEATURES")
+        print_table(
+            build_numeric_distribution_overview(
+                dataset,
+                exclude_columns=SKEW_EXCLUDE_COLUMNS,
+            )
+        )
+
     print("\nAdding log features...")
     dataset = add_log_features(dataset)
+
+    if verbose:
+        print_section("SKEWNESS COMPARISON BEFORE AND AFTER LOG TRANSFORMATION")
+        print_table(build_log_skewness_comparison(dataset))
 
     print("\nSelecting final columns...")
     model_data = select_model_columns(dataset)
 
-    print_variable_overview_only(
-        df=model_data,
-        title="FINAL VARIABLES FOR EDA AND MODELING",
-        table_name="final_eda_dataset"
-    )
+    print("\nOptimizing dtypes...")
+    model_data = optimize_dtypes(model_data)
+
+    if verbose:
+        print_section("FINAL VARIABLES FOR EDA AND MODELING")
+        print_table(build_variable_overview(model_data))
 
     print("\nSaving model data...")
     save_outputs(model_data)
 
     print("\nProcessing completed.")
+
+    return model_data
+
 
 if __name__ == "__main__":
     main()
