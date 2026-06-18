@@ -146,6 +146,7 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
+        "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
     }
     if y_score is not None:
         metrics["roc_auc"] = roc_auc_score(y_true, y_score)
@@ -184,7 +185,7 @@ def evaluate_holdout(models, X_train, X_test, y_train, y_test) -> pd.DataFrame:
         row.update(compute_metrics(y_test, y_pred, y_score))
         rows.append(row)
 
-    results = pd.DataFrame(rows).sort_values("f1", ascending=False).reset_index(drop=True)
+    results = pd.DataFrame(rows).sort_values("roc_auc", ascending=False).reset_index(drop=True)
     return results, fitted
 
 
@@ -210,7 +211,7 @@ def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
             row[f"{metric}_std"] = values.std()
         rows.append(row)
 
-    return pd.DataFrame(rows).sort_values("f1_mean", ascending=False).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values("roc_auc_mean", ascending=False).reset_index(drop=True)
 
 
 def plot_confusion(model, X_test, y_test, name: str) -> None:
@@ -253,7 +254,7 @@ def main() -> None:
     print(f"\nSaved: {OUTPUT_DIR / 'model_comparison_holdout.csv'}")
 
     best_name = results.iloc[0]["model"]
-    print(f"\nBest model by F1: {best_name}")
+    print(f"\nBest model by ROC-AUC (baseline-proof): {best_name}")
     plot_confusion(fitted[best_name], X_test, y_test, best_name)
 
     if DO_CV:

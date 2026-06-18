@@ -18,6 +18,24 @@ from reporting import (
     build_log_skewness_comparison,
 )
 
+# ---------------------------------------------------------------------------
+# Study scope
+# ---------------------------------------------------------------------------
+
+MIN_REVIEW_YEAR = 2010
+
+SELECTED_CITY_STATE_SCOPE = [
+    ("Philadelphia", "PA"),
+    ("New Orleans", "LA"),
+    ("Nashville", "TN"),
+    ("Tampa", "FL"),
+    ("Indianapolis", "IN"),
+    ("Tucson", "AZ"),
+    ("Saint Louis", "MO"),
+    ("Reno", "NV"),
+    ("Santa Barbara", "CA"),
+    ("Saint Petersburg", "FL"),
+]
 
 RANDOM_STATE = 42
 
@@ -727,6 +745,87 @@ def add_log_features(dataset: pd.DataFrame) -> pd.DataFrame:
 
     return dataset
 
+def filter_study_scope(dataset: pd.DataFrame) -> pd.DataFrame:
+    """
+    Restrict the dataset to the selected study scope.
+
+    Scope:
+    - selected top 10 city-state restaurant markets
+    - reviews from 2010 onward, including 2010
+
+    This filter is applied after city standardization and date cleaning, so the
+    selected city names match the cleaned city names and the NOAA merge keys.
+    """
+    dataset = dataset.copy()
+
+    required_columns = {"city", "state", "review_year"}
+    missing_columns = required_columns - set(dataset.columns)
+
+    if missing_columns:
+        raise ValueError(
+            "Cannot filter study scope because these columns are missing: "
+            f"{sorted(missing_columns)}"
+        )
+
+    rows_before = len(dataset)
+
+    selected_pairs = pd.DataFrame(
+        SELECTED_CITY_STATE_SCOPE,
+        columns=["city", "state"],
+    )
+
+    dataset = dataset[dataset["review_year"] >= MIN_REVIEW_YEAR].copy()
+
+    dataset = dataset.merge(
+        selected_pairs,
+        on=["city", "state"],
+        how="inner",
+    )
+
+    rows_after = len(dataset)
+
+    print("\nApplied study-scope filter.")
+    print(f"Rows before filter: {rows_before:,}")
+    print(f"Rows after filter:  {rows_after:,}")
+    print(f"Minimum review year: {MIN_REVIEW_YEAR}")
+
+    print("\nReviews by selected city-state:")
+    city_summary = (
+        dataset.groupby(["city", "state"], observed=True)
+        .size()
+        .reset_index(name="review_count")
+        .sort_values("review_count", ascending=False)
+    )
+    print(city_summary.to_string(index=False))
+
+    print("\nReviews by year:")
+    year_summary = (
+        dataset.groupby("review_year", observed=True)
+        .size()
+        .reset_index(name="review_count")
+        .sort_values("review_year")
+    )
+    print(year_summary.to_string(index=False))
+
+    missing_scope_pairs = selected_pairs.merge(
+        city_summary[["city", "state"]],
+        on=["city", "state"],
+        how="left",
+        indicator=True,
+    )
+
+    missing_scope_pairs = missing_scope_pairs[
+        missing_scope_pairs["_merge"] == "left_only"
+    ][["city", "state"]]
+
+    if not missing_scope_pairs.empty:
+        print("\nWARNING: These selected city-state pairs have zero rows:")
+        print(missing_scope_pairs.to_string(index=False))
+
+    if dataset.empty:
+        raise ValueError("Study-scope filter removed all rows.")
+
+    return dataset
 
 def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
     """Select final columns for EDA and modeling."""
@@ -927,9 +1026,13 @@ def main(verbose: bool = VERBOSE) -> None:
         photo_features=photo_features,
     )
 
-    print("\nCleaning values...")
+    print("\nCleaning values.")
     dataset = clean_values(dataset)
     dataset = standardize_city_names(dataset)
+    
+    print("\nFiltering study scope.")
+    dataset = filter_study_scope(dataset)
+
 
     if verbose:
         print_section("NEGATIVE VALUE CHECK")
