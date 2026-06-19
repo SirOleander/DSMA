@@ -32,7 +32,16 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+    BaggingClassifier,
+)
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -1300,6 +1309,7 @@ def build_weather_enriched(yelp: pd.DataFrame, refresh: bool = False) -> pd.Data
 # 3. EXPLORATORY DATA ANALYSIS
 # ================================================================================
 
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -1309,16 +1319,11 @@ PLOT_OUTPUT_DIR = EDA_OUTPUT_DIR / "plots"
 PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TARGET_COL = "satisfied"
-# review_stars is the canonical leakage column for the stars distribution plot;
-# LEAKAGE_COLS (from config) additionally covers business_stars and
-# user_average_stars, which leak the target via all-time averages.
+# review_stars is shown for context only: the target is derived from it, so it
+# (and the other LEAKAGE_COLS) are excluded from the modelling correlation matrix.
 LEAKAGE_COL = "review_stars"
 
-TOP_N = 15
-MIN_CATEGORY_COUNT = 1_000
-PLOT_SAMPLE_N = 500_000
-
-# Focused variables for report-ready EDA
+# Numeric variables summarised in the descriptive-statistics table.
 KEY_NUMERIC_COLS = [
     "review_text_length",
     "log_review_text_length",
@@ -1340,75 +1345,12 @@ KEY_NUMERIC_COLS = [
     "weather_temp_range",
 ]
 
-KEY_CATEGORICAL_COLS = [
-    "state",
-    "city",
-    "is_open",
-    "attributes.RestaurantsPriceRange2",
-    "attributes.RestaurantsTakeOut",
-    "attributes.RestaurantsDelivery",
-    "attributes.OutdoorSeating",
-    "attributes.RestaurantsReservations",
-    "attributes.Alcohol",
-    "attributes.NoiseLevel",
-    "weather_available",
-    "is_rainy",
-    "is_snowy",
-    "is_hot",
-    "is_cold",
-]
-
-OUTLIER_COLS = [
-    "review_text_length",
-    "review_useful",
-    "review_funny",
-    "review_cool",
-    "business_review_count",
-    "user_review_count",
-    "user_fans",
-    "user_useful",
-    "user_funny",
-    "user_cool",
-    "checkin_count",
-    "tip_count",
-    "tip_compliment_count",
-    "photo_count",
-    "weather_prcp",
-    "weather_snow",
-    "weather_snow_depth",
-    "weather_tmax",
-    "weather_tmin",
-    "weather_temp_range",
-]
-
-IMPOSSIBLE_VALUE_RULES = {
-    "satisfied": (0, 1),
-    "review_stars": (1, 5),
-    "business_stars": (1, 5),
-    "user_average_stars": (1, 5),
-    "review_text_length": (0, None),
-    "review_useful": (0, None),
-    "review_funny": (0, None),
-    "review_cool": (0, None),
-    "business_review_count": (0, None),
-    "user_review_count": (0, None),
-    "user_fans": (0, None),
-    "user_useful": (0, None),
-    "user_funny": (0, None),
-    "user_cool": (0, None),
-    "checkin_count": (0, None),
-    "tip_count": (0, None),
-    "tip_compliment_count": (0, None),
-    "photo_count": (0, None),
-    "weather_prcp": (0, None),
-    "weather_snow": (0, None),
-    "weather_snow_depth": (0, None),
-    "weather_temp_range": (0, None),
-}
+# |r| at or above this flags two predictors as redundant (multicollinearity).
+CORR_THRESHOLD = 0.8
 
 
 # =============================================================================
-# General helpers
+# Helpers
 # =============================================================================
 
 def available_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
@@ -1440,178 +1382,52 @@ def plot_bar(
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-
     if rotate_labels:
         plt.xticks(rotation=45, ha="right")
-
     save_current_plot(filename)
-
-
-def plot_histogram(
-    df: pd.DataFrame,
-    column: str,
-    title: str,
-    xlabel: str,
-    filename: str,
-    bins: int = 50,
-    sample_n: int | None = None,
-) -> None:
-    if column not in df.columns:
-        return
-
-    data = df[column].dropna()
-
-    if data.empty:
-        return
-
-    if sample_n is not None and len(data) > sample_n:
-        data = data.sample(n=sample_n, random_state=42)
-
-    plt.figure(figsize=(10, 6))
-    plt.hist(data, bins=bins)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel("Frequency")
-
-    save_current_plot(filename)
-
-
-def plot_boxplot(
-    df: pd.DataFrame,
-    column: str,
-    title: str,
-    filename: str,
-    sample_n: int | None = None,
-) -> None:
-    if column not in df.columns:
-        return
-
-    data = df[column].dropna()
-
-    if data.empty:
-        return
-
-    if sample_n is not None and len(data) > sample_n:
-        data = data.sample(n=sample_n, random_state=42)
-
-    plt.figure(figsize=(9, 5))
-    plt.boxplot(data, vert=False, showfliers=True)
-    plt.title(title)
-    plt.xlabel(column)
-
-    save_current_plot(filename)
-
-
-def satisfaction_by_category(
-    df: pd.DataFrame,
-    category_col: str,
-    top_n: int | None = None,
-    min_count: int = 0,
-) -> pd.DataFrame:
-    if category_col not in df.columns:
-        return pd.DataFrame()
-
-    table = (
-        df.groupby(category_col, dropna=False, observed=True)
-        .agg(
-            review_count=(TARGET_COL, "size"),
-            satisfaction_rate=(TARGET_COL, "mean"),
-        )
-        .reset_index()
-    )
-
-    table["satisfaction_rate_percent"] = (
-        table["satisfaction_rate"] * 100
-    ).round(2)
-
-    table = table.sort_values("review_count", ascending=False)
-
-    if min_count > 0:
-        table = table[table["review_count"] >= min_count].copy()
-
-    if top_n is not None:
-        table = table.head(top_n).copy()
-
-    return table
-
-
-def satisfaction_by_quantile_bins(
-    df: pd.DataFrame,
-    column: str,
-    q: int = 5,
-) -> pd.DataFrame:
-    if column not in df.columns:
-        return pd.DataFrame()
-
-    temp = df[[column, TARGET_COL]].dropna().copy()
-
-    if temp.empty:
-        return pd.DataFrame()
-
-    try:
-        temp[f"{column}_bin"] = pd.qcut(
-            temp[column],
-            q=q,
-            duplicates="drop",
-        ).astype(str)
-    except ValueError:
-        return pd.DataFrame()
-
-    table = (
-        temp.groupby(f"{column}_bin", dropna=False)
-        .agg(
-            review_count=(TARGET_COL, "size"),
-            satisfaction_rate=(TARGET_COL, "mean"),
-            min_value=(column, "min"),
-            max_value=(column, "max"),
-        )
-        .reset_index()
-    )
-
-    table["satisfaction_rate_percent"] = (
-        table["satisfaction_rate"] * 100
-    ).round(2)
-
-    return table
 
 
 # =============================================================================
-# Dataset overview
+# Descriptive statistics
 # =============================================================================
 
-def run_dataset_overview(df: pd.DataFrame) -> None:
-    print_section("Dataset overview")
+def run_descriptive_stats(df: pd.DataFrame) -> None:
+    print_section("Descriptive statistics")
 
     overview = pd.DataFrame([{
         "rows": df.shape[0],
         "columns": df.shape[1],
-        "unique_reviews": df["review_id"].nunique() if "review_id" in df.columns else np.nan,
-        "unique_businesses": df["business_id"].nunique() if "business_id" in df.columns else np.nan,
-        "unique_users": df["user_id"].nunique() if "user_id" in df.columns else np.nan,
-        "unique_cities": df["city"].nunique() if "city" in df.columns else np.nan,
-        "unique_states": df["state"].nunique() if "state" in df.columns else np.nan,
         "overall_satisfaction_rate_percent": round(df[TARGET_COL].mean() * 100, 2),
     }])
+    print_table(overview, "Dataset shape")
 
-    print_table(overview, "Dataset shape and key counts")
-
-    if "review_id" in df.columns:
-        duplicate_review_count = df["review_id"].duplicated().sum()
-        duplicate_table = pd.DataFrame([{
-            "duplicate_review_id_count": duplicate_review_count,
-            "duplicate_review_id_percent": round(duplicate_review_count / len(df) * 100, 4),
-        }])
-        print_table(duplicate_table, "Duplicate review_id check")
+    cols = available_columns(df, KEY_NUMERIC_COLS)
+    if cols:
+        summary = (
+            df[cols]
+            .describe(percentiles=[0.25, 0.50, 0.75])
+            .T
+            .reset_index()
+            .rename(columns={"index": "variable"})
+        )
+        print_table(
+            summary,
+            "Numeric summary (count, mean, std, min, quartiles, max)",
+            max_rows=50,
+        )
 
     missing = pd.DataFrame({
         "variable": df.columns,
         "missing_count": df.isna().sum().values,
         "missing_percent": (df.isna().mean().values * 100).round(2),
-        "dtype": [str(dtype) for dtype in df.dtypes],
-        "unique_values": [df[col].nunique(dropna=True) for col in df.columns],
-    }).sort_values(["missing_percent", "missing_count"], ascending=False)
-
-    print_table(missing, "Variables with most missing values", max_rows=25)
+    })
+    missing = missing[missing["missing_count"] > 0].sort_values(
+        "missing_percent", ascending=False
+    )
+    if missing.empty:
+        print("\nNo missing values.")
+    else:
+        print_table(missing, "Variables with missing values", max_rows=25)
 
 
 # =============================================================================
@@ -1628,11 +1444,9 @@ def run_target_analysis(df: pd.DataFrame) -> None:
         .reset_index(name="review_count")
         .sort_values(TARGET_COL)
     )
-
     target["percent"] = (
         target["review_count"] / target["review_count"].sum() * 100
     ).round(2)
-
     print_table(target, "Target distribution")
 
     plot_bar(
@@ -1654,11 +1468,9 @@ def run_target_analysis(df: pd.DataFrame) -> None:
             .reset_index(name="review_count")
             .sort_values(LEAKAGE_COL)
         )
-
         stars["percent"] = (
             stars["review_count"] / stars["review_count"].sum() * 100
         ).round(2)
-
         print_table(stars, "Review stars distribution")
 
         plot_bar(
@@ -1674,548 +1486,72 @@ def run_target_analysis(df: pd.DataFrame) -> None:
 
 
 # =============================================================================
-# Geographic EDA
+# Correlation matrix (relevance + multicollinearity)
 # =============================================================================
 
-def run_geographic_analysis(df: pd.DataFrame) -> None:
-    print_section("Geographic analysis")
+def run_correlation_matrix(df: pd.DataFrame) -> None:
+    print_section("Correlation matrix")
 
-    if "state" in df.columns:
-        top_states = (
-            df["state"]
-            .value_counts(dropna=False)
-            .head(TOP_N)
-            .rename_axis("state")
-            .reset_index(name="review_count")
-        )
+    numeric_df = df.select_dtypes(include="number")
+    # Drop leakage columns so they don't dominate the matrix or the ranking.
+    leak = [c for c in LEAKAGE_COLS if c in numeric_df.columns]
+    numeric_df = numeric_df.drop(columns=leak)
 
-        print_table(top_states, f"Top {TOP_N} states by review count")
-
-        plot_bar(
-            top_states,
-            x_col="state",
-            y_col="review_count",
-            title=f"Top {TOP_N} states by review count",
-            xlabel="State",
-            ylabel="Number of reviews",
-            filename="top_states_review_count.png",
-        )
-
-        sat_by_state = satisfaction_by_category(
-            df,
-            "state",
-            top_n=TOP_N,
-            min_count=MIN_CATEGORY_COUNT,
-        )
-
-        print_table(sat_by_state, f"Satisfaction by top {TOP_N} states")
-
-    if "city" in df.columns:
-        top_cities = (
-            df["city"]
-            .value_counts(dropna=False)
-            .head(TOP_N)
-            .rename_axis("city")
-            .reset_index(name="review_count")
-        )
-
-        print_table(top_cities, f"Top {TOP_N} cities by review count")
-
-        plot_bar(
-            top_cities,
-            x_col="city",
-            y_col="review_count",
-            title=f"Top {TOP_N} cities by review count",
-            xlabel="City",
-            ylabel="Number of reviews",
-            filename="top_cities_review_count.png",
-        )
-
-        sat_by_city = satisfaction_by_category(
-            df,
-            "city",
-            top_n=TOP_N,
-            min_count=MIN_CATEGORY_COUNT,
-        )
-
-        print_table(sat_by_city, f"Satisfaction by top {TOP_N} cities")
-
-        plot_bar(
-            sat_by_city,
-            x_col="city",
-            y_col="satisfaction_rate_percent",
-            title=f"Satisfaction rate by top {TOP_N} cities",
-            xlabel="City",
-            ylabel="Satisfaction rate (%)",
-            filename="satisfaction_by_top_city.png",
-        )
-
-
-# =============================================================================
-# Focused feature EDA
-# =============================================================================
-
-def run_focused_numeric_eda(df: pd.DataFrame) -> None:
-    print_section("Focused numeric EDA")
-
-    cols = available_columns(df, KEY_NUMERIC_COLS)
-
-    if not cols:
-        print("No selected numeric columns available.")
+    if TARGET_COL not in numeric_df.columns or numeric_df.shape[1] < 2:
+        print("Not enough numeric columns for a correlation matrix.")
         return
 
-    summary = (
-        df[cols]
-        .describe(percentiles=[0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99])
-        .T
+    corr = numeric_df.corr(numeric_only=True)
+
+    # 1. Relevance: how each numeric feature correlates with the target.
+    target_corr = (
+        corr[TARGET_COL]
+        .drop(TARGET_COL)
+        .rename("correlation_with_satisfied")
         .reset_index()
         .rename(columns={"index": "variable"})
     )
-
-    print_table(summary, "Numeric summary for selected variables", max_rows=50)
-
-    plot_cols = [
-        "log_review_text_length",
-        "business_stars",
-        "log_business_review_count",
-        "user_average_stars",
-        "log_user_review_count",
-        "log_checkin_count",
-        "log_tip_count",
-        "log_photo_count",
-        "weather_tmax",
-        "weather_prcp",
-    ]
-
-    for col in available_columns(df, plot_cols):
-        plot_histogram(
-            df=df,
-            column=col,
-            title=f"Distribution of {col}",
-            xlabel=col,
-            filename=f"distribution_{col}.png",
-            bins=50,
-            sample_n=PLOT_SAMPLE_N,
-        )
-
-    bin_cols = [
-        "review_text_length",
-        "business_stars",
-        "log_business_review_count",
-        "user_average_stars",
-        "log_user_review_count",
-        "log_checkin_count",
-        "log_tip_count",
-        "log_photo_count",
-    ]
-
-    for col in available_columns(df, bin_cols):
-        table = satisfaction_by_quantile_bins(df, col, q=5)
-        print_table(table, f"Satisfaction by {col} bins", max_rows=10)
-
-        if not table.empty:
-            plot_bar(
-                table,
-                x_col=f"{col}_bin",
-                y_col="satisfaction_rate_percent",
-                title=f"Satisfaction rate by {col} bins",
-                xlabel=f"{col} bin",
-                ylabel="Satisfaction rate (%)",
-                filename=f"satisfaction_by_{col}_bins.png",
-            )
-
-
-def run_focused_categorical_eda(df: pd.DataFrame) -> None:
-    print_section("Focused categorical EDA")
-
-    selected_cols = [
-        "attributes.RestaurantsPriceRange2",
-        "is_open",
-        "attributes.RestaurantsTakeOut",
-        "attributes.RestaurantsDelivery",
-        "attributes.OutdoorSeating",
-        "attributes.RestaurantsReservations",
-        "attributes.Alcohol",
-        "attributes.NoiseLevel",
-    ]
-
-    for col in available_columns(df, selected_cols):
-        table = satisfaction_by_category(
-            df,
-            col,
-            min_count=MIN_CATEGORY_COUNT,
-        )
-
-        print_table(table, f"Satisfaction by {col}", max_rows=20)
-
-        if not table.empty and table.shape[0] <= 15:
-            safe_col = col.replace(".", "_")
-            plot_bar(
-                table,
-                x_col=col,
-                y_col="satisfaction_rate_percent",
-                title=f"Satisfaction rate by {col}",
-                xlabel=col,
-                ylabel="Satisfaction rate (%)",
-                filename=f"satisfaction_by_{safe_col}.png",
-            )
-
-
-# =============================================================================
-# Weather EDA
-# =============================================================================
-
-def run_weather_analysis(df: pd.DataFrame) -> None:
-    print_section("Weather EDA")
-
-    if "weather_available" not in df.columns:
-        print("weather_available is missing. Skipping weather EDA.")
-        return
-
-    coverage = pd.DataFrame([{
-        "reviews": len(df),
-        "weather_available_reviews": int(df["weather_available"].sum()),
-        "weather_coverage_percent": round(df["weather_available"].mean() * 100, 2),
-    }])
-
-    print_table(coverage, "Overall weather coverage")
-
-    if "city" in df.columns and "state" in df.columns:
-        coverage_by_city = (
-            df.groupby(["city", "state"], dropna=False, observed=True)
-            .agg(
-                review_count=(TARGET_COL, "size"),
-                weather_coverage_percent=("weather_available", lambda x: x.mean() * 100),
-            )
-            .reset_index()
-            .sort_values("review_count", ascending=False)
-            .head(TOP_N)
-        )
-
-        coverage_by_city["weather_coverage_percent"] = (
-            coverage_by_city["weather_coverage_percent"].round(2)
-        )
-
-        print_table(coverage_by_city, f"Weather coverage by top {TOP_N} cities")
-
-        plot_bar(
-            coverage_by_city,
-            x_col="city",
-            y_col="weather_coverage_percent",
-            title=f"Weather coverage by top {TOP_N} cities",
-            xlabel="City",
-            ylabel="Weather coverage (%)",
-            filename="weather_coverage_by_city.png",
-        )
-
-    df_weather = df[df["weather_available"] == 1].copy()
-
-    if df_weather.empty:
-        print("No weather-covered reviews found.")
-        return
-
-    weather_value_cols = available_columns(
-        df_weather,
-        [
-            "weather_prcp",
-            "weather_snow",
-            "weather_snow_depth",
-            "weather_tmax",
-            "weather_tmin",
-            "weather_temp_range",
-        ],
+    target_corr["abs"] = target_corr["correlation_with_satisfied"].abs()
+    target_corr = (
+        target_corr.sort_values("abs", ascending=False).drop(columns="abs")
     )
+    print_table(target_corr, "Correlation with target (satisfied)", max_rows=40)
 
-    if weather_value_cols:
-        weather_summary = (
-            df_weather[weather_value_cols]
-            .describe(percentiles=[0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99])
-            .T
-            .reset_index()
-            .rename(columns={"index": "variable"})
+    # 2. Multicollinearity: predictor pairs with |r| >= CORR_THRESHOLD.
+    predictors = corr.drop(index=TARGET_COL, columns=TARGET_COL)
+    names = predictors.columns.tolist()
+    pairs = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            r = predictors.iloc[i, j]
+            if pd.notna(r) and abs(r) >= CORR_THRESHOLD:
+                pairs.append({
+                    "feature_1": names[i],
+                    "feature_2": names[j],
+                    "correlation": round(float(r), 3),
+                })
+
+    pairs_df = pd.DataFrame(pairs)
+    if pairs_df.empty:
+        print(f"\nNo feature pairs with |correlation| >= {CORR_THRESHOLD}.")
+    else:
+        pairs_df = pairs_df.reindex(
+            pairs_df["correlation"].abs().sort_values(ascending=False).index
+        ).reset_index(drop=True)
+        print_table(
+            pairs_df,
+            f"Highly correlated feature pairs (|r| >= {CORR_THRESHOLD}) - candidates to drop",
+            max_rows=40,
         )
 
-        print_table(weather_summary, "Weather summary among weather-covered reviews")
-
-    for col in available_columns(df_weather, ["is_rainy", "is_snowy", "is_hot", "is_cold"]):
-        table = satisfaction_by_category(df_weather, col, min_count=0)
-        print_table(table, f"Satisfaction by {col}")
-
-        plot_bar(
-            table,
-            x_col=col,
-            y_col="satisfaction_rate_percent",
-            title=f"Satisfaction rate by {col}",
-            xlabel=col,
-            ylabel="Satisfaction rate (%)",
-            filename=f"satisfaction_by_{col}.png",
-            rotate_labels=False,
-        )
-
-    for col in available_columns(df_weather, ["weather_tmax", "weather_prcp"]):
-        table = satisfaction_by_quantile_bins(df_weather, col, q=5)
-        print_table(table, f"Satisfaction by {col} bins", max_rows=10)
-
-        if not table.empty:
-            plot_bar(
-                table,
-                x_col=f"{col}_bin",
-                y_col="satisfaction_rate_percent",
-                title=f"Satisfaction rate by {col} bins",
-                xlabel=f"{col} bin",
-                ylabel="Satisfaction rate (%)",
-                filename=f"satisfaction_by_{col}_bins.png",
-            )
-
-
-# =============================================================================
-# Correlation EDA
-# =============================================================================
-
-def run_correlation_analysis(df: pd.DataFrame) -> None:
-    print_section("Correlation analysis")
-
-    numeric_df = df.select_dtypes(include=[np.number]).copy()
-
-    drop_cols = [
-        col for col in ID_COLS + ["weather_available"]
-        if col in numeric_df.columns
-    ]
-
-    numeric_df = numeric_df.drop(columns=drop_cols, errors="ignore")
-
-    if TARGET_COL not in numeric_df.columns:
-        print("Target is missing from numeric columns. Skipping correlation analysis.")
-        return
-
-    corr = numeric_df.corr(numeric_only=True)[TARGET_COL].drop(TARGET_COL)
-
-    corr_table = (
-        corr
-        .reset_index()
-        .rename(columns={
-            "index": "variable",
-            TARGET_COL: "correlation_with_satisfied",
-        })
-    )
-
-    corr_table["absolute_correlation"] = corr_table["correlation_with_satisfied"].abs()
-
-    corr_table["note"] = np.where(
-        corr_table["variable"].isin(LEAKAGE_COLS),
-        "LEAKAGE: leaks the target; exclude from modelling",
-        "",
-    )
-
-    corr_table = corr_table.sort_values("absolute_correlation", ascending=False)
-
-    print_table(corr_table, "Top numeric correlations with satisfied", max_rows=30)
-
-    plot_corr = (
-        corr_table[~corr_table["variable"].isin(LEAKAGE_COLS)]
-        .head(20)
-        .sort_values("correlation_with_satisfied")
-    )
-
-    if not plot_corr.empty:
-        plt.figure(figsize=(10, 8))
-        plt.barh(
-            plot_corr["variable"],
-            plot_corr["correlation_with_satisfied"],
-        )
-        plt.title("Top numeric correlations with satisfied, excluding leakage columns")
-        plt.xlabel("Correlation with satisfied")
-        plt.ylabel("Variable")
-        save_current_plot("numeric_correlation_with_satisfied.png")
-
-
-# =============================================================================
-# Outlier analysis
-# =============================================================================
-
-def impossible_value_check(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-
-    for col, (min_allowed, max_allowed) in IMPOSSIBLE_VALUE_RULES.items():
-        if col not in df.columns:
-            continue
-
-        values = pd.to_numeric(df[col], errors="coerce")
-
-        invalid_mask = pd.Series(False, index=df.index)
-
-        if min_allowed is not None:
-            invalid_mask = invalid_mask | (values < min_allowed)
-
-        if max_allowed is not None:
-            invalid_mask = invalid_mask | (values > max_allowed)
-
-        invalid_count = int(invalid_mask.sum())
-
-        rows.append({
-            "variable": col,
-            "min_allowed": min_allowed,
-            "max_allowed": max_allowed,
-            "observed_min": values.min(),
-            "observed_max": values.max(),
-            "invalid_count": invalid_count,
-            "invalid_percent": round(invalid_count / len(df) * 100, 4),
-        })
-
-    return pd.DataFrame(rows).sort_values("invalid_count", ascending=False)
-
-
-def iqr_outlier_table(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    rows = []
-
-    for col in available_columns(df, columns):
-        values = pd.to_numeric(df[col], errors="coerce").dropna()
-
-        if values.empty:
-            continue
-
-        q1 = values.quantile(0.25)
-        q3 = values.quantile(0.75)
-        iqr = q3 - q1
-
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-
-        lower_outliers = int((values < lower_bound).sum())
-        upper_outliers = int((values > upper_bound).sum())
-        total_outliers = lower_outliers + upper_outliers
-
-        rows.append({
-            "variable": col,
-            "count": values.shape[0],
-            "min": values.min(),
-            "p01": values.quantile(0.01),
-            "p05": values.quantile(0.05),
-            "q1": q1,
-            "median": values.median(),
-            "q3": q3,
-            "p95": values.quantile(0.95),
-            "p99": values.quantile(0.99),
-            "max": values.max(),
-            "iqr_lower_bound": lower_bound,
-            "iqr_upper_bound": upper_bound,
-            "lower_outliers": lower_outliers,
-            "upper_outliers": upper_outliers,
-            "total_outliers": total_outliers,
-            "outlier_percent": round(total_outliers / values.shape[0] * 100, 2),
-        })
-
-    return (
-        pd.DataFrame(rows)
-        .sort_values("outlier_percent", ascending=False)
-    )
-
-
-def top_extreme_values(df: pd.DataFrame, column: str, n: int = 10) -> pd.DataFrame:
-    id_cols = available_columns(df, ["review_id", "business_id", "user_id", "city", "state", TARGET_COL, LEAKAGE_COL])
-    cols = id_cols + [column]
-
-    return (
-        df[cols]
-        .dropna(subset=[column])
-        .sort_values(column, ascending=False)
-        .head(n)
-    )
-
-
-def run_outlier_analysis(df: pd.DataFrame) -> None:
-    print_section("Outlier analysis")
-
-    print(
-        "Outlier policy: Do not drop rows only because they are statistically extreme. "
-        "For this Yelp dataset, many count variables are naturally right-skewed. "
-        "Rows should only be removed if values are impossible or clearly caused by data corruption."
-    )
-
-    invalid_table = impossible_value_check(df)
-    print_table(invalid_table, "Impossible value checks", max_rows=50)
-
-    outlier_table = iqr_outlier_table(df, OUTLIER_COLS)
-    print_table(outlier_table, "IQR-based outlier diagnostics", max_rows=50)
-
-    boxplot_cols = [
-        "review_text_length",
-        "business_review_count",
-        "user_review_count",
-        "checkin_count",
-        "tip_count",
-        "photo_count",
-        "weather_prcp",
-        "weather_tmax",
-        "weather_tmin",
-    ]
-
-    for col in available_columns(df, boxplot_cols):
-        plot_boxplot(
-            df=df,
-            column=col,
-            title=f"Boxplot for {col}",
-            filename=f"boxplot_{col}.png",
-            sample_n=PLOT_SAMPLE_N,
-        )
-
-    extreme_cols = [
-        "review_text_length",
-        "business_review_count",
-        "user_review_count",
-        "checkin_count",
-        "tip_count",
-        "photo_count",
-        "weather_prcp",
-    ]
-
-    for col in available_columns(df, extreme_cols):
-        extreme = top_extreme_values(df, col, n=10)
-        print_table(extreme, f"Top 10 largest values for {col}", max_rows=10)
-
-
-# =============================================================================
-# EDA notes
-# =============================================================================
-
-def run_eda_notes(df: pd.DataFrame) -> None:
-    print_section("EDA notes for report")
-
-    notes = [
-        {
-            "topic": "EDA scope",
-            "note": "The EDA is intentionally focused on key variables and variable groups rather than deeply analyzing all available columns.",
-        },
-        {
-            "topic": "Leakage",
-            "note": "review_stars, business_stars and user_average_stars are shown in EDA but must be excluded from modelling: satisfied is derived from review_stars, and the two averages already include the current review's rating (target + temporal leakage).",
-        },
-        {
-            "topic": "Outliers",
-            "note": "Large count values are expected in Yelp data and should usually be handled with log transformations rather than deleted.",
-        },
-        {
-            "topic": "Dropping rows",
-            "note": "Rows should only be removed if they contain impossible values or clear data errors, not merely because they are extreme under the IQR rule.",
-        },
-    ]
-
-    if "weather_available" in df.columns:
-        notes.append({
-            "topic": "Weather coverage",
-            "note": (
-                f"Weather data are available for {df['weather_available'].mean() * 100:.2f}% of reviews. "
-                "Missing weather is structural because only selected cities were matched to NOAA stations."
-            ),
-        })
-
-    if "weather_tobs" not in df.columns:
-        notes.append({
-            "topic": "Weather TOBS",
-            "note": "weather_tobs is absent because NOAA did not return TOBS for the selected station requests.",
-        })
-
-    print_table(pd.DataFrame(notes), "Summary notes", max_rows=20)
+    # 3. Full correlation matrix as a heatmap for the report.
+    plt.figure(figsize=(12, 10))
+    plt.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+    plt.colorbar(label="Pearson correlation")
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=90, fontsize=7)
+    plt.yticks(range(len(corr.columns)), corr.columns, fontsize=7)
+    plt.title("Numeric feature correlation matrix")
+    save_current_plot("correlation_matrix.png")
 
 
 # =============================================================================
@@ -2226,18 +1562,13 @@ def eda_main(df: pd.DataFrame) -> None:
     print_section("Exploratory data analysis")
     print(f"Rows: {df.shape[0]:,} | Columns: {df.shape[1]:,}")
 
-    run_dataset_overview(df)
+    run_descriptive_stats(df)
     run_target_analysis(df)
-    run_geographic_analysis(df)
-    run_focused_numeric_eda(df)
-    run_focused_categorical_eda(df)
-    run_weather_analysis(df)
-    run_correlation_analysis(df)
-    run_outlier_analysis(df)
-    run_eda_notes(df)
+    run_correlation_matrix(df)
 
     print_section("EDA completed")
     print(f"Plots saved to: {PLOT_OUTPUT_DIR}")
+
 
 # ================================================================================
 # 4. FEATURE ENGINEERING  (leakage-safe feature set + preprocessing)
@@ -2308,6 +1639,16 @@ def select_features(
     return X, y
 
 
+def stratified_subsample(X: pd.DataFrame, y: pd.Series, n: int | None):
+    """Draw a stratified subsample of n rows (keeps the class balance)."""
+    if n is None or len(X) <= n:
+        return X, y
+    Xs, _, ys, _ = train_test_split(
+        X, y, train_size=n, stratify=y, random_state=RANDOM_STATE
+    )
+    return Xs, ys
+
+
 def split_data(
     X: pd.DataFrame,
     y: pd.Series,
@@ -2357,7 +1698,12 @@ def build_preprocessor(
 
     categorical_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", min_frequency=50)),
+        # sparse_output=False -> dense matrix, required by GaussianNB and the
+        # MLP. Safe here because the categoricals are low-cardinality (10 cities,
+        # binary attributes, etc.), so the one-hot width stays small.
+        ("onehot", OneHotEncoder(
+            handle_unknown="ignore", min_frequency=50, sparse_output=False
+        )),
     ])
 
     preprocessor = ColumnTransformer(
@@ -2382,6 +1728,14 @@ def build_preprocessor(
 OUTPUT_DIR = PROCESSED_DATA_DIR / "model_outputs"
 PLOT_DIR = OUTPUT_DIR / "plots"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Several required models (SVM, KNN, the neural net) cannot train on millions
+# of rows. For a fair, tractable comparison every model is fit on the same
+# stratified subsample of this size (set to None to use the full dataset, only
+# sensible if you drop SVM/KNN). 100k preserves the class balance and is ample
+# for ranking algorithms.
+MODEL_SAMPLE_N = 100_000
 
 
 # Light cross-validation for stability. Off by default because k-fold on
@@ -2427,29 +1781,122 @@ def build_tree_preprocessor(X: pd.DataFrame):
     return preprocessor, categorical_mask
 
 
+def build_ordinal_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list[str], list[str]]:
+    """
+    Ordinal preprocessor for the classic tree ensembles (decision tree, bagging,
+    random forest). Like build_tree_preprocessor but maps unseen/missing
+    categories to a -1 integer sentinel instead of NaN, because those estimators
+    reject NaN in older scikit-learn versions. No scaling (trees don't need it).
+    """
+    numeric, categorical = split_feature_types(X)
+
+    numeric_pipe = Pipeline([("impute", SimpleImputer(strategy="median"))])
+
+    categorical_pipe = Pipeline([
+        ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
+        ("ordinal", OrdinalEncoder(
+            handle_unknown="use_encoded_value",
+            unknown_value=-1,
+            encoded_missing_value=-1,
+        )),
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipe, numeric),
+            ("cat", categorical_pipe, categorical),
+        ],
+        remainder="drop",
+    )
+
+    return preprocessor, numeric, categorical
+
+
 # ---------------------------------------------------------------------------
 # Model definitions
 # ---------------------------------------------------------------------------
 
 def build_models(X_train: pd.DataFrame) -> dict:
-    """Build the candidate models, each as a complete leakage-safe Pipeline."""
-    linear_pre, _, _ = build_preprocessor(X_train, scale_numeric=True)
-    tree_pre, cat_mask = build_tree_preprocessor(X_train)
+    """Build the candidate models, each as a complete leakage-safe Pipeline.
+
+    Preprocessor routing:
+      - scaled_pre (standardised + dense one-hot): logit, SVM, KNN, NB, MLP
+      - ordinal_pre (-1 sentinel, no scaling):     decision tree, bagging, RF
+      - hgb_pre (NaN + native categoricals):       histogram gradient boosting
+    class_weight="balanced" is set where the estimator supports it; KNN, NB and
+    the MLP have no such parameter and rely on the balanced metrics instead.
+    """
+    scaled_pre, _, _ = build_preprocessor(X_train, scale_numeric=True)
+    ordinal_pre, _, _ = build_ordinal_preprocessor(X_train)
+    hgb_pre, cat_mask = build_tree_preprocessor(X_train)
 
     return {
         "baseline_most_frequent": Pipeline([
             ("model", DummyClassifier(strategy="most_frequent")),
         ]),
         "logistic_regression": Pipeline([
-            ("pre", linear_pre),
+            ("pre", scaled_pre),
             ("model", LogisticRegression(
                 max_iter=1000,
                 class_weight="balanced",
                 solver="lbfgs",
             )),
         ]),
+        "svm_linear": Pipeline([
+            ("pre", scaled_pre),
+            # Linear SVM (kernel SVM is infeasible at this scale). dual=False is
+            # the recommended setting when n_samples > n_features.
+            ("model", LinearSVC(
+                C=1.0,
+                class_weight="balanced",
+                dual=False,
+                max_iter=5000,
+            )),
+        ]),
+        "knn": Pipeline([
+            ("pre", scaled_pre),
+            ("model", KNeighborsClassifier(n_neighbors=25, n_jobs=-1)),
+        ]),
+        "naive_bayes": Pipeline([
+            ("pre", scaled_pre),
+            ("model", GaussianNB()),
+        ]),
+        "neural_net": Pipeline([
+            ("pre", scaled_pre),
+            ("model", MLPClassifier(
+                hidden_layer_sizes=(64,),
+                early_stopping=True,
+                max_iter=100,
+                random_state=RANDOM_STATE,
+            )),
+        ]),
+        "decision_tree": Pipeline([
+            ("pre", ordinal_pre),
+            ("model", DecisionTreeClassifier(
+                max_depth=12,
+                class_weight="balanced",
+                random_state=RANDOM_STATE,
+            )),
+        ]),
+        "bagging": Pipeline([
+            ("pre", ordinal_pre),
+            ("model", BaggingClassifier(
+                n_estimators=50,
+                n_jobs=-1,
+                random_state=RANDOM_STATE,
+            )),
+        ]),
+        "random_forest": Pipeline([
+            ("pre", ordinal_pre),
+            ("model", RandomForestClassifier(
+                n_estimators=200,
+                class_weight="balanced",
+                n_jobs=-1,
+                random_state=RANDOM_STATE,
+            )),
+        ]),
         "hist_gradient_boosting": Pipeline([
-            ("pre", tree_pre),
+            ("pre", hgb_pre),
             ("model", HistGradientBoostingClassifier(
                 categorical_features=cat_mask,
                 class_weight="balanced",
@@ -2483,9 +1930,12 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
 
 
 def get_scores(model, X) -> np.ndarray | None:
-    """Positive-class probabilities if available, else None."""
+    """Positive-class confidence scores: predict_proba if available, else the
+    decision_function (for LinearSVC), else None."""
     if hasattr(model, "predict_proba"):
         return model.predict_proba(X)[:, 1]
+    if hasattr(model, "decision_function"):
+        return model.decision_function(X)
     return None
 
 
@@ -2559,6 +2009,11 @@ def plot_confusion(model, X_test, y_test, name: str) -> None:
 def models_main(df: pd.DataFrame) -> None:
     print("Building feature set...")
     X, y = select_features(df)
+
+    X, y = stratified_subsample(X, y, MODEL_SAMPLE_N)
+    if MODEL_SAMPLE_N is not None:
+        print(f"Using a stratified subsample of {len(X):,} rows for the model comparison.")
+
     X_train, X_test, y_train, y_test = split_data(X, y)
     print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows "
           f"| positive rate {y.mean() * 100:.2f}%")
