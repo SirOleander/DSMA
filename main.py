@@ -176,6 +176,21 @@ def print_table(
     ):
         print(df.head(max_rows).to_string(index=False))
 
+
+def report_feature_change(step: str, before, after) -> None:
+    """Print which columns a processing step added or dropped."""
+    before_cols, after_cols = list(before), list(after)
+    added = [c for c in after_cols if c not in set(before_cols)]
+    dropped = [c for c in before_cols if c not in set(after_cols)]
+
+    print(f"\n[{step}] columns: {len(before_cols)} -> {len(after_cols)}")
+    if added:
+        print(f"  + added ({len(added)}): {added}")
+    if dropped:
+        print(f"  - dropped ({len(dropped)}): {dropped}")
+    if not added and not dropped:
+        print("  (no column changes)")
+
 # ================================================================================
 # 1. IMPORT DATA  (parse raw pgAdmin JSON exports)
 # ================================================================================
@@ -717,49 +732,38 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
     return dataset
 
 
-def add_log_features(dataset: pd.DataFrame) -> pd.DataFrame:
-    """Add log-transformed versions of skewed non-negative count variables."""
-    dataset = dataset.copy()
+# Skewed, non-negative count features that are log1p-transformed at the
+# modelling stage (after EDA). Shared by the EDA skewness comparison and the
+# log-and-replace step so the two never drift apart.
+LOG_CANDIDATES = [
+    # Business activity / popularity
+    "business_review_count",
 
-    log_candidates = [
-        # Business activity / popularity
-        "business_review_count",
+    # User activity / history
+    "user_review_count",
+    "user_useful",
+    "user_funny",
+    "user_cool",
+    "user_fans",
 
-        # User activity / history
-        "user_review_count",
-        "user_useful",
-        "user_funny",
-        "user_cool",
-        "user_fans",
+    # Business engagement / activity
+    "checkin_count",
+    "tip_count",
+    "tip_compliment_count",
+    "photo_count",
+    "photo_food",
+    "photo_drink",
+    "photo_menu",
+    "photo_inside",
+    "photo_outside",
 
-        # Business engagement / activity
-        "checkin_count",
-        "tip_count",
-        "tip_compliment_count",
-        "photo_count",
-        "photo_food",
-        "photo_drink",
-        "photo_menu",
-        "photo_inside",
-        "photo_outside",
+    # Review-level behavior
+    "review_useful",
+    "review_funny",
+    "review_cool",
+    "review_text_length",
+]
 
-        # Review-level behavior
-        "review_useful",
-        "review_funny",
-        "review_cool",
-        "review_text_length",
-    ]
-
-    for col in log_candidates:
-        if col in dataset.columns:
-            values = pd.to_numeric(dataset[col], errors="coerce")
-            # log1p of the non-negative value. Missing values stay NaN on
-            # purpose: imputation is deferred to the modelling pipeline so it
-            # can be fit on training data only. Genuine count columns have
-            # already been 0-filled in clean_values(), so their logs are 0.
-            dataset[f"log_{col}"] = np.log1p(values.clip(lower=0))
-
-    return dataset
 
 def filter_study_scope(dataset: pd.DataFrame) -> pd.DataFrame:
     """
@@ -867,10 +871,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "review_useful",
         "review_funny",
         "review_cool",
-        "log_review_useful",
-        "log_review_funny",
-        "log_review_cool",
-        "log_review_text_length",
         "review_year",
         "review_month",
         "review_weekday",
@@ -879,7 +879,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         # Business-level variables
         "business_stars",
         "business_review_count",
-        "log_business_review_count",
         "is_open",
         "city",
         "state",
@@ -907,11 +906,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "user_useful",
         "user_funny",
         "user_cool",
-        "log_user_review_count",
-        "log_user_fans",
-        "log_user_useful",
-        "log_user_funny",
-        "log_user_cool",
 
         # Restaurant activity features
         "checkin_count",
@@ -923,15 +917,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "photo_menu",
         "photo_inside",
         "photo_outside",
-        "log_checkin_count",
-        "log_tip_count",
-        "log_tip_compliment_count",
-        "log_photo_count",
-        "log_photo_food",
-        "log_photo_drink",
-        "log_photo_menu",
-        "log_photo_inside",
-        "log_photo_outside",
     ]
 
     available_columns = [col for col in model_columns if col in dataset.columns]
@@ -977,25 +962,42 @@ def process_data(tables: dict) -> pd.DataFrame:
     tip = tables["tip"]
     photo = tables["photo"]
 
+    # prepare_core_tables renames columns (e.g. stars -> review_stars) and adds
+    # the target. Renames are not feature add/drops, so we only flag the target.
     business, reviews, users = prepare_core_tables(
         business=business,
         reviews=reviews,
         users=users,
     )
+    print("\n[prepare_core_tables] created target column 'satisfied' on reviews")
 
+    # First feature drop: keep only the columns we need from each table, before
+    # the merge copies them across millions of rows.
+    cols_before = {
+        "business": list(business.columns),
+        "reviews": list(reviews.columns),
+        "users": list(users.columns),
+    }
     business, reviews, users = select_columns_before_merge(
         business=business,
         reviews=reviews,
         users=users,
     )
+    after_tables = {"business": business, "reviews": reviews, "users": users}
+    for name, before in cols_before.items():
+        report_feature_change(f"select_columns_before_merge [{name}]",
+                              before, after_tables[name].columns)
 
     review_sample = sample_reviews(reviews)
 
+    # The check-in / tip / photo tables are collapsed into per-business count
+    # features here; they get attached to the dataset at the merge step below.
     checkin_features = create_checkin_features(checkin)
     tip_features = create_tip_features(tip)
     photo_features = create_photo_features(photo)
 
     print("\nMerging tables...")
+    review_cols = list(review_sample.columns)
     dataset = merge_tables(
         reviews=review_sample,
         business=business,
@@ -1004,19 +1006,26 @@ def process_data(tables: dict) -> pd.DataFrame:
         tip_features=tip_features,
         photo_features=photo_features,
     )
+    # Merge ADDS the business, user, and count columns onto each review row.
+    report_feature_change("merge_tables", review_cols, dataset.columns)
 
     print("\nCleaning values...")
+    clean_before = list(dataset.columns)
     dataset = clean_values(dataset)
     dataset = standardize_city_names(dataset)
+    report_feature_change("clean_values (+ standardize_city_names)",
+                          clean_before, dataset.columns)
 
     print("\nFiltering study scope...")
+    rows_before = len(dataset)
     dataset = filter_study_scope(dataset)
-
-    print("\nAdding log features...")
-    dataset = add_log_features(dataset)
+    print(f"\n[filter_study_scope] dropped ROWS, not columns: "
+          f"{rows_before:,} -> {len(dataset):,}")
 
     print("\nSelecting final columns...")
+    select_before = list(dataset.columns)
     model_data = select_model_columns(dataset)
+    report_feature_change("select_model_columns", select_before, model_data.columns)
 
     print("\nOptimizing dtypes...")
     model_data = optimize_dtypes(model_data)
@@ -1066,6 +1075,21 @@ TOP_CITIES = [
     {"city": "Reno", "state": "NV", "station": "USW00023185"},
     {"city": "Santa Barbara", "state": "CA", "station": "USW00023190"},
     {"city": "Saint Petersburg", "state": "FL", "station": "USW00092806"},
+    {"city": "Boise", "state": "ID", "station": "USW00024131"},
+    {"city": "Edmonton", "state": "AB", "station": "CA003012209"},
+    {"city": "Clearwater", "state": "FL", "station": "USW00012842"},
+    {"city": "Metairie", "state": "LA", "station": "USW00012916"},
+    {"city": "Sparks", "state": "NV", "station": "USW00023185"},
+    {"city": "Franklin", "state": "TN", "station": "USW00013897"},
+    {"city": "Wilmington", "state": "DE", "station": "USW00013781"},
+    {"city": "Brandon", "state": "FL", "station": "USW00012842"},
+    {"city": "Carmel", "state": "IN", "station": "USW00093819"},
+    {"city": "Saint Pete Beach", "state": "FL", "station": "USW00012842"},
+    {"city": "Goleta", "state": "CA", "station": "USW00023190"},
+    {"city": "Cherry Hill", "state": "NJ", "station": "USW00013739"},
+    {"city": "Meridian", "state": "ID", "station": "USW00024131"},
+    {"city": "King of Prussia", "state": "PA", "station": "USW00013739"},
+    {"city": "Dunedin", "state": "FL", "station": "USW00012842"},
 ]
 
 
@@ -1300,7 +1324,9 @@ def build_weather_enriched(yelp: pd.DataFrame, refresh: bool = False) -> pd.Data
     weather = aggregate_duplicate_weather_rows(weather)
 
     print("Merging NOAA weather into Yelp data...")
+    yelp_cols = list(yelp.columns)
     enriched = merge_weather(yelp, weather)
+    report_feature_change("weather merge", yelp_cols, enriched.columns)
 
     save_weather_outputs(enriched)
     return enriched
@@ -1323,22 +1349,23 @@ TARGET_COL = "satisfied"
 # (and the other LEAKAGE_COLS) are excluded from the modelling correlation matrix.
 LEAKAGE_COL = "review_stars"
 
-# Numeric variables summarised in the descriptive-statistics table.
+# Raw numeric variables summarised in the descriptive-statistics table. EDA runs
+# on untransformed data, so these are the original (skewed) counts - inspecting
+# them is what motivates the log transform applied afterwards.
 KEY_NUMERIC_COLS = [
     "review_text_length",
-    "log_review_text_length",
     "business_stars",
     "business_review_count",
-    "log_business_review_count",
     "user_average_stars",
     "user_review_count",
-    "log_user_review_count",
+    "user_fans",
+    "user_useful",
+    "user_funny",
+    "user_cool",
     "checkin_count",
-    "log_checkin_count",
     "tip_count",
-    "log_tip_count",
+    "tip_compliment_count",
     "photo_count",
-    "log_photo_count",
     "weather_prcp",
     "weather_tmax",
     "weather_tmin",
@@ -1428,6 +1455,42 @@ def run_descriptive_stats(df: pd.DataFrame) -> None:
         print("\nNo missing values.")
     else:
         print_table(missing, "Variables with missing values", max_rows=25)
+
+
+# =============================================================================
+# Skewness: raw vs log-transformed
+# =============================================================================
+
+def run_skewness_comparison(df: pd.DataFrame) -> None:
+    """
+    Compare the skewness of each count feature before and after a log1p
+    transform. This is the EDA justification for the transform applied at the
+    modelling stage: a large drop in |skew| toward 0 means the log makes the
+    distribution far more symmetric.
+    """
+    print_section("Skewness: raw vs log-transformed")
+
+    rows = []
+    for col in LOG_CANDIDATES:
+        if col not in df.columns:
+            continue
+        raw = pd.to_numeric(df[col], errors="coerce")
+        logged = np.log1p(raw.clip(lower=0))
+        skew_raw = float(raw.skew())
+        skew_log = float(logged.skew())
+        rows.append({
+            "variable": col,
+            "skew_raw": round(skew_raw, 3),
+            "skew_log": round(skew_log, 3),
+            "abs_improvement": round(abs(skew_raw) - abs(skew_log), 3),
+        })
+
+    table = pd.DataFrame(rows).sort_values("abs_improvement", ascending=False)
+    print_table(
+        table,
+        "Skewness reduction from log1p (higher abs_improvement = more symmetric)",
+        max_rows=40,
+    )
 
 
 # =============================================================================
@@ -1555,6 +1618,99 @@ def run_correlation_matrix(df: pd.DataFrame) -> None:
 
 
 # =============================================================================
+# Multicollinearity: Variance Inflation Factor
+# =============================================================================
+
+def run_vif(df: pd.DataFrame) -> None:
+    """
+    Variance Inflation Factor (VIF) for the numeric predictors.
+
+    VIF_i = 1 / (1 - R_i^2), where R_i^2 is from regressing predictor i on all
+    the other predictors. Equivalently it is the i-th diagonal element of the
+    inverse correlation matrix, which is how it is computed here (no extra
+    dependency). Unlike the pairwise table, VIF measures *multivariate*
+    collinearity: how well a feature is explained by the others combined, which
+    catches redundancy that no single pairwise correlation reveals.
+
+    Conventional thresholds (rules of thumb, not exact laws):
+      VIF > 5  -> moderate multicollinearity
+      VIF > 10 -> severe multicollinearity
+    """
+    print_section("Multicollinearity: variance inflation factor (VIF)")
+
+    numeric = df.select_dtypes(include="number").copy()
+    drop = [c for c in LEAKAGE_COLS + [TARGET_COL] if c in numeric.columns]
+    numeric = numeric.drop(columns=drop)
+
+    # VIF is undefined for all-NaN or constant columns; remove them first.
+    numeric = numeric.loc[:, numeric.notna().any()]
+    constant = numeric.nunique()[lambda s: s <= 1].index.tolist()
+    if constant:
+        numeric = numeric.drop(columns=constant)
+        print(f"Excluded constant columns: {constant}")
+
+    if numeric.shape[1] < 2:
+        print("Not enough numeric predictors for VIF.")
+        return
+
+    # Median-impute so every predictor is complete for the regressions below.
+    numeric = numeric.fillna(numeric.median(numeric_only=True))
+
+    # VIF is a structural property, so estimate it on a sample for speed on
+    # large data (the estimate is essentially identical to the full-data value).
+    if len(numeric) > 200_000:
+        numeric = numeric.sample(200_000, random_state=RANDOM_STATE)
+
+    cols = numeric.columns.tolist()
+    matrix = numeric.to_numpy(dtype=float)
+    n_rows = len(matrix)
+
+    # VIF_i = 1 / (1 - R_i^2), with R_i^2 from regressing predictor i on the
+    # rest (intercept included). lstsq handles rank-deficiency gracefully: an
+    # exact dependency (e.g. a total = sum of its parts) drives R^2 -> 1 and so
+    # VIF -> infinity, which we report as a near-perfect dependency.
+    records = []
+    for j, col in enumerate(cols):
+        y = matrix[:, j]
+        others = np.delete(matrix, j, axis=1)
+        others = np.column_stack([np.ones(n_rows), others])  # intercept
+        beta, *_ = np.linalg.lstsq(others, y, rcond=None)
+        residual = y - others @ beta
+        ss_res = float(residual @ residual)
+        ss_tot = float(((y - y.mean()) ** 2).sum())
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        r2 = min(max(r2, 0.0), 1.0)
+        vif_value = np.inf if r2 >= 0.9999 else 1.0 / (1.0 - r2)
+        records.append({"variable": col, "VIF": vif_value})
+
+    vif = pd.DataFrame(records).sort_values("VIF", ascending=False).reset_index(drop=True)
+
+    # Very large VIFs (> 1000) mean a (near-)exact linear dependency - e.g. a
+    # total equal to the sum of its parts, or a range = max - min. The exact
+    # magnitude is meaningless there, so we report it as a dependency rather
+    # than a number.
+    def _flag(v: float) -> str:
+        if v > 1000:
+            return "near-perfect dependency"
+        if v > 10:
+            return "severe (>10)"
+        if v > 5:
+            return "moderate (>5)"
+        return ""
+
+    display = pd.DataFrame({
+        "variable": vif["variable"],
+        "VIF": vif["VIF"].map(lambda v: ">1000" if v > 1000 else f"{v:,.2f}"),
+        "flag": vif["VIF"].map(_flag),
+    })
+
+    print_table(display, "VIF per predictor", max_rows=50)
+    print("\nRule of thumb: VIF > 5 = moderate, VIF > 10 = severe multicollinearity.")
+    print("'>1000' marks a near-exact linear dependency, e.g. a total equal to the")
+    print("sum of its parts (photo_count) or a range equal to max - min (temp_range).")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1565,6 +1721,7 @@ def eda_main(df: pd.DataFrame) -> None:
     run_descriptive_stats(df)
     run_target_analysis(df)
     run_correlation_matrix(df)
+    run_vif(df)
 
     print_section("EDA completed")
     print(f"Plots saved to: {PLOT_OUTPUT_DIR}")
@@ -1585,6 +1742,71 @@ REVIEW_VOTE_COLS = [
     "review_useful", "review_funny", "review_cool",
     "log_review_useful", "log_review_funny", "log_review_cool",
 ]
+
+# Features removed after EDA because of multicollinearity / VIF. Names are given
+# in their pre-log form; the drop step below removes whichever form (raw or
+# log_) actually exists after the log-and-replace.
+DROP_FOR_REDUNDANCY = [
+    # Photo sub-types: photo_count is their exact sum (near-perfect dependency,
+    # VIF -> infinity). Keep photo_count.
+    "photo_food", "photo_drink", "photo_menu", "photo_inside", "photo_outside",
+    # Temperature: weather_temp_range = tmax - tmin (near-perfect dependency).
+    # Keep weather_tmax and weather_temp_range.
+    "weather_tmin",
+    # User votes: severe multicollinearity (VIF >> 10). Keep user_useful.
+    "user_funny", "user_cool",
+    # Business activity: moderate multicollinearity. Keep business_review_count.
+    "checkin_count", "tip_count",
+]
+
+
+def log_and_replace_skewed(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace each skewed count feature with its log1p version (raw dropped).
+
+    Missing values stay NaN on purpose: imputation is deferred to the modelling
+    pipeline so it is fit on training data only.
+    """
+    df = df.copy()
+    before = list(df.columns)
+    for col in LOG_CANDIDATES:
+        if col in df.columns:
+            values = pd.to_numeric(df[col], errors="coerce")
+            df[f"log_{col}"] = np.log1p(values.clip(lower=0))
+            df = df.drop(columns=col)
+    report_feature_change("log_and_replace_skewed", before, df.columns)
+    return df
+
+
+def drop_redundant_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop the features flagged by the EDA correlation/VIF analysis."""
+    df = df.copy()
+    before = list(df.columns)
+    to_drop = [
+        candidate
+        for name in DROP_FOR_REDUNDANCY
+        for candidate in (name, f"log_{name}")
+        if candidate in df.columns
+    ]
+    df = df.drop(columns=to_drop)
+    report_feature_change("drop_redundant_features", before, df.columns)
+    return df
+
+
+def build_model_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    EDA-informed transition from the EDA dataset to the modelling dataset:
+      1. drop the redundant features (justified by the correlation/VIF tables),
+      2. show the skewness comparison for the features we keep, then
+      3. log-and-replace those skewed counts.
+
+    Dropping first means we never transform a feature we won't use, and the
+    skewness comparison only covers the features that survive into the model.
+    """
+    print_section("Building modelling dataset (post-EDA feature decisions)")
+    df = drop_redundant_features(df)
+    run_skewness_comparison(df)
+    df = log_and_replace_skewed(df)
+    return df
 
 
 def select_features(
@@ -2061,7 +2283,8 @@ def main() -> None:
     re-parsed each time. To force a rebuild, delete DATASET_PKL or set
     REBUILD = True.
     """
-    REBUILD = False
+    REBUILD = True
+    RUN_MODELS = False   # set True to also run the log transform + modelling
 
     if DATASET_PKL.exists() and not REBUILD:
         print(f"Loading existing dataset: {DATASET_PKL}")
@@ -2071,11 +2294,19 @@ def main() -> None:
         processed = process_data(tables)              # 2. clean / merge / sample
         enriched = build_weather_enriched(processed)  # 2b. + NOAA weather (saved)
 
-    eda_main(enriched)                                # 3. EDA on the final dataset
-    models_main(enriched)                             # 4-5. features + train + results
+    eda_main(enriched)                                # 3. EDA on the raw (untransformed) data
+
+    # 4. EDA-informed transition (always runs, so the feature decisions are
+    #    visible even in an EDA-only run): log-and-replace the skewed counts,
+    #    then drop the redundant features from the correlation/VIF analysis.
+    model_df = build_model_dataset(enriched)
+
+    if RUN_MODELS:
+        models_main(model_df)                         # 5-6. features + train + results
 
     print("\nDone.")
-    print(f"Final dataset: {enriched.shape[0]:,} rows x {enriched.shape[1]} columns")
+    print(f"EDA dataset:       {enriched.shape[0]:,} rows x {enriched.shape[1]} columns")
+    print(f"Modelling dataset: {model_df.shape[0]:,} rows x {model_df.shape[1]} columns")
 
 
 if __name__ == "__main__":
