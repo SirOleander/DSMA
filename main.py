@@ -63,8 +63,6 @@ from sklearn.metrics import (
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_DIR = Path(__file__).resolve().parent
-
 DATA_DIR = Path(r"C:\Users\fynne\University\Data Science and Marketing Analytics\data")
 RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
@@ -95,6 +93,10 @@ WEATHER_CACHE_PKL = EXTERNAL_DATA_DIR / "noaa_weather_daily_top_cities.pkl"
 # ---------------------------------------------------------------------------
 ID_COLS = ["review_id", "business_id", "user_id"]
 
+# Binary classification target: 1 if the review awarded >= 4 stars. Single
+# source of truth used by both the EDA and the modelling stages.
+TARGET = "satisfied"
+
 # Columns that must be excluded from modelling because they leak the target.
 # - review_stars: satisfied is derived directly from it.
 # - business_stars / user_average_stars: all-time averages that already include
@@ -124,10 +126,9 @@ WEATHER_BINARY_COLS = [
 
 WEATHER_FEATURE_COLS = WEATHER_NUMERIC_COLS + WEATHER_BINARY_COLS
 
-# Columns used to decide whether a weather record was matched. Deliberately
-# excludes any TOBS-based column so weather_available keeps the exact same
-# meaning (and coverage %) it had before TOBS was ever requested.
-WEATHER_AVAILABILITY_COLS = WEATHER_NUMERIC_COLS + WEATHER_BINARY_COLS
+# Columns used to decide whether a weather record was matched. Identical to the
+# full weather feature set; kept as a named alias to document that intent.
+WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 
 # Global random seed (single source of truth).
 RANDOM_STATE = 42
@@ -459,12 +460,17 @@ def sample_reviews(reviews: pd.DataFrame) -> pd.DataFrame:
 
 
 def create_checkin_features(checkin: pd.DataFrame) -> pd.DataFrame:
-    """Create business-level check-in features."""
+    """Create business-level check-in features.
+
+    checkin['date'] holds a comma-separated list of timestamps per business, so
+    the number of check-ins is (number of commas + 1), with an empty/missing
+    value meaning zero. Computed vectorised rather than row-by-row.
+    """
     checkin = checkin.copy()
 
-    checkin["checkin_count"] = checkin["date"].fillna("").apply(
-        lambda x: 0 if x == "" else len(str(x).split(","))
-    )
+    dates = checkin["date"].fillna("").astype(str)
+    counts = dates.str.count(",").add(1).where(dates.ne(""), 0)
+    checkin["checkin_count"] = counts.astype("int64")
 
     return checkin[["business_id", "checkin_count"]]
 
@@ -1345,10 +1351,8 @@ EDA_OUTPUT_DIR = PROCESSED_DATA_DIR / "eda_outputs"
 PLOT_OUTPUT_DIR = EDA_OUTPUT_DIR / "plots"
 PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGET_COL = "satisfied"
 # review_stars is shown for context only: the target is derived from it, so it
 # (and the other LEAKAGE_COLS) are excluded from the modelling correlation matrix.
-LEAKAGE_COL = "review_stars"
 
 # Raw numeric variables summarised in the descriptive-statistics table. EDA runs
 # on untransformed data, so these are the original (skewed) counts - inspecting
@@ -1425,7 +1429,7 @@ def run_descriptive_stats(df: pd.DataFrame) -> None:
     overview = pd.DataFrame([{
         "rows": df.shape[0],
         "columns": df.shape[1],
-        "overall_satisfaction_rate_percent": round(df[TARGET_COL].mean() * 100, 2),
+        "overall_satisfaction_rate_percent": round(df[TARGET].mean() * 100, 2),
     }])
     print_table(overview, "Dataset shape")
 
@@ -1502,11 +1506,11 @@ def run_target_analysis(df: pd.DataFrame) -> None:
     print_section("Target analysis")
 
     target = (
-        df[TARGET_COL]
+        df[TARGET]
         .value_counts(dropna=False)
-        .rename_axis(TARGET_COL)
+        .rename_axis(TARGET)
         .reset_index(name="review_count")
-        .sort_values(TARGET_COL)
+        .sort_values(TARGET)
     )
     target["percent"] = (
         target["review_count"] / target["review_count"].sum() * 100
@@ -1515,7 +1519,7 @@ def run_target_analysis(df: pd.DataFrame) -> None:
 
     plot_bar(
         target,
-        x_col=TARGET_COL,
+        x_col=TARGET,
         y_col="review_count",
         title="Target distribution: satisfied",
         xlabel="Satisfied",
@@ -1524,13 +1528,13 @@ def run_target_analysis(df: pd.DataFrame) -> None:
         rotate_labels=False,
     )
 
-    if LEAKAGE_COL in df.columns:
+    if LEAKAGE_COLS[0] in df.columns:
         stars = (
-            df[LEAKAGE_COL]
+            df[LEAKAGE_COLS[0]]
             .value_counts(dropna=False)
-            .rename_axis(LEAKAGE_COL)
+            .rename_axis(LEAKAGE_COLS[0])
             .reset_index(name="review_count")
-            .sort_values(LEAKAGE_COL)
+            .sort_values(LEAKAGE_COLS[0])
         )
         stars["percent"] = (
             stars["review_count"] / stars["review_count"].sum() * 100
@@ -1539,7 +1543,7 @@ def run_target_analysis(df: pd.DataFrame) -> None:
 
         plot_bar(
             stars,
-            x_col=LEAKAGE_COL,
+            x_col=LEAKAGE_COLS[0],
             y_col="review_count",
             title="Distribution of review stars",
             xlabel="Review stars",
@@ -1561,7 +1565,7 @@ def run_correlation_matrix(df: pd.DataFrame) -> None:
     leak = [c for c in LEAKAGE_COLS if c in numeric_df.columns]
     numeric_df = numeric_df.drop(columns=leak)
 
-    if TARGET_COL not in numeric_df.columns or numeric_df.shape[1] < 2:
+    if TARGET not in numeric_df.columns or numeric_df.shape[1] < 2:
         print("Not enough numeric columns for a correlation matrix.")
         return
 
@@ -1569,8 +1573,8 @@ def run_correlation_matrix(df: pd.DataFrame) -> None:
 
     # 1. Relevance: how each numeric feature correlates with the target.
     target_corr = (
-        corr[TARGET_COL]
-        .drop(TARGET_COL)
+        corr[TARGET]
+        .drop(TARGET)
         .rename("correlation_with_satisfied")
         .reset_index()
         .rename(columns={"index": "variable"})
@@ -1582,7 +1586,7 @@ def run_correlation_matrix(df: pd.DataFrame) -> None:
     print_table(target_corr, "Correlation with target (satisfied)", max_rows=40)
 
     # 2. Multicollinearity: predictor pairs with |r| >= CORR_THRESHOLD.
-    predictors = corr.drop(index=TARGET_COL, columns=TARGET_COL)
+    predictors = corr.drop(index=TARGET, columns=TARGET)
     names = predictors.columns.tolist()
     pairs = []
     for i in range(len(names)):
@@ -1640,7 +1644,7 @@ def run_vif(df: pd.DataFrame) -> None:
     print_section("Multicollinearity: variance inflation factor (VIF)")
 
     numeric = df.select_dtypes(include="number").copy()
-    drop = [c for c in LEAKAGE_COLS + [TARGET_COL] if c in numeric.columns]
+    drop = [c for c in LEAKAGE_COLS + [TARGET] if c in numeric.columns]
     numeric = numeric.drop(columns=drop)
 
     # VIF is undefined for all-NaN or constant columns; remove them first.
@@ -1732,7 +1736,6 @@ def eda_main(df: pd.DataFrame) -> None:
 # 4. FEATURE ENGINEERING  (leakage-safe feature set + preprocessing)
 # ================================================================================
 
-TARGET = "satisfied"
 DATE_COL = "review_date"
 
 # Votes a review accumulates from OTHER users after it is posted. They are not
@@ -1909,7 +1912,7 @@ def split_data(
     X: pd.DataFrame,
     y: pd.Series,
     test_size: float = 0.2,
-    random_state: int = 42,
+    random_state: int = RANDOM_STATE,
 ):
     """Stratified train/test split (preserves the satisfied class balance)."""
     return train_test_split(
@@ -1929,49 +1932,65 @@ def split_feature_types(X: pd.DataFrame) -> tuple[list[str], list[str]]:
     return numeric, categorical
 
 
-def build_preprocessor(
+def _assemble_preprocessor(
     X: pd.DataFrame,
-    scale_numeric: bool = True,
+    categorical_encoder,
+    scale_numeric: bool,
 ) -> tuple[ColumnTransformer, list[str], list[str]]:
-    """
-    Build an UNFITTED preprocessing ColumnTransformer.
+    """Build an UNFITTED numeric + categorical ColumnTransformer.
+
+    Shared scaffolding behind the three public preprocessor builders. Only two
+    things vary between models: whether numerics are standardised, and which
+    encoder handles the categoricals.
 
     - Numeric: median imputation (covers the 7 unmatched users and the
-      structural weather NaNs), then optional standardisation. Set
-      scale_numeric=False for tree-based models, which don't need scaling.
-    - Categorical: constant 'Unknown' imputation, then one-hot encoding with
-      handle_unknown='ignore' so unseen categories at test time are safe.
+      structural weather NaNs), then optional standardisation (trees skip it).
+    - Categorical: constant 'Unknown' imputation, then the supplied encoder.
 
-    Weather NaNs are median-imputed here. (The weather_available missing-
-    indicator was dropped earlier for ~0 signal; if reinstated, it would ride
-    along in the numeric block so the model could tell imputed rows apart.)
+    Returns (preprocessor, numeric_cols, categorical_cols).
     """
     numeric, categorical = split_feature_types(X)
 
     numeric_steps = [("impute", SimpleImputer(strategy="median"))]
     if scale_numeric:
         numeric_steps.append(("scale", StandardScaler()))
-    numeric_pipe = Pipeline(numeric_steps)
 
     categorical_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
-        # sparse_output=False -> dense matrix, required by GaussianNB and the
-        # MLP. Safe here because the categoricals are low-cardinality (10 cities,
-        # binary attributes, etc.), so the one-hot width stays small.
-        ("onehot", OneHotEncoder(
-            handle_unknown="ignore", min_frequency=50, sparse_output=False
-        )),
+        ("encode", categorical_encoder),
     ])
 
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", numeric_pipe, numeric),
+            ("num", Pipeline(numeric_steps), numeric),
             ("cat", categorical_pipe, categorical),
         ],
         remainder="drop",
     )
 
     return preprocessor, numeric, categorical
+
+
+def build_preprocessor(
+    X: pd.DataFrame,
+    scale_numeric: bool = True,
+) -> tuple[ColumnTransformer, list[str], list[str]]:
+    """
+    Preprocessor for the scaled models (logit, SVM, KNN, NB, MLP).
+
+    Categoricals are one-hot encoded with handle_unknown='ignore' so unseen
+    categories at test time are safe. sparse_output=False gives a dense matrix
+    (required by GaussianNB and the MLP); safe here because the categoricals are
+    low-cardinality (10 cities, binary attributes), so the width stays small.
+
+    Weather NaNs are median-imputed in the numeric block. (The weather_available
+    missing-indicator was dropped earlier for ~0 signal; if reinstated it would
+    ride along here so the model could tell imputed rows apart.)
+    """
+    encoder = OneHotEncoder(
+        handle_unknown="ignore", min_frequency=50, sparse_output=False
+    )
+    return _assemble_preprocessor(X, encoder, scale_numeric)
 
 
 # ================================================================================
@@ -2016,32 +2035,20 @@ PERM_REPEATS = 5
 
 def build_tree_preprocessor(X: pd.DataFrame):
     """
-    Preprocessor for tree models: median-impute numerics (no scaling) and
-    ordinal-encode categoricals so HistGradientBoosting can treat them as true
-    categoricals natively. Returns (preprocessor, categorical_mask) where the
-    mask aligns with the transformed column order [numeric..., categorical...].
+    Preprocessor for HistGradientBoosting: median-impute numerics (no scaling)
+    and ordinal-encode categoricals so the model can treat them as true
+    categoricals natively (unseen/missing -> NaN). Returns
+    (preprocessor, categorical_mask) where the mask aligns with the transformed
+    column order [numeric..., categorical...].
     """
-    numeric, categorical = split_feature_types(X)
-
-    numeric_pipe = Pipeline([("impute", SimpleImputer(strategy="median"))])
-
-    categorical_pipe = Pipeline([
-        ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
-        ("ordinal", OrdinalEncoder(
-            handle_unknown="use_encoded_value",
-            unknown_value=np.nan,          # unseen categories -> treated as missing
-            encoded_missing_value=np.nan,
-        )),
-    ])
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipe, numeric),
-            ("cat", categorical_pipe, categorical),
-        ],
-        remainder="drop",
+    encoder = OrdinalEncoder(
+        handle_unknown="use_encoded_value",
+        unknown_value=np.nan,          # unseen categories -> treated as missing
+        encoded_missing_value=np.nan,
     )
-
+    preprocessor, numeric, categorical = _assemble_preprocessor(
+        X, encoder, scale_numeric=False
+    )
     categorical_mask = [False] * len(numeric) + [True] * len(categorical)
     return preprocessor, categorical_mask
 
@@ -2053,28 +2060,12 @@ def build_ordinal_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list
     categories to a -1 integer sentinel instead of NaN, because those estimators
     reject NaN in older scikit-learn versions. No scaling (trees don't need it).
     """
-    numeric, categorical = split_feature_types(X)
-
-    numeric_pipe = Pipeline([("impute", SimpleImputer(strategy="median"))])
-
-    categorical_pipe = Pipeline([
-        ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
-        ("ordinal", OrdinalEncoder(
-            handle_unknown="use_encoded_value",
-            unknown_value=-1,
-            encoded_missing_value=-1,
-        )),
-    ])
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipe, numeric),
-            ("cat", categorical_pipe, categorical),
-        ],
-        remainder="drop",
+    encoder = OrdinalEncoder(
+        handle_unknown="use_encoded_value",
+        unknown_value=-1,
+        encoded_missing_value=-1,
     )
-
-    return preprocessor, numeric, categorical
+    return _assemble_preprocessor(X, encoder, scale_numeric=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2490,7 +2481,7 @@ def main() -> None:
     REBUILD = True.
     """
     REBUILD = False
-    RUN_MODELS = False   # set True to also run the log transform + modelling
+    RUN_MODELS = True   # set True to also run the log transform + modelling
 
     if DATASET_PKL.exists() and not REBUILD:
         print(f"Loading existing dataset: {DATASET_PKL}")
