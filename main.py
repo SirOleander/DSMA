@@ -25,7 +25,8 @@ import pandas as pd
 import requests
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate, GridSearchCV
+from sklearn.inspection import permutation_importance
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -1759,6 +1760,22 @@ DROP_FOR_REDUNDANCY = [
     "checkin_count", "tip_count",
 ]
 
+# Features we don't use at all, removed BEFORE the EDA so they don't appear in
+# the EDA tables. weather_available is the weather missing-indicator: correct to
+# include in principle, but it carries ~0 signal here, so we choose not to use it.
+DROP_LOW_SIGNAL = ["weather_available"]
+
+
+def drop_low_signal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop features we won't use (e.g. the weather_available missing-indicator).
+    Called before EDA so they stay out of the analysis as well."""
+    df = df.copy()
+    before = list(df.columns)
+    cols = [c for c in DROP_LOW_SIGNAL if c in df.columns]
+    df = df.drop(columns=cols)
+    report_feature_change("drop_low_signal_features", before, df.columns)
+    return df
+
 
 def log_and_replace_skewed(df: pd.DataFrame) -> pd.DataFrame:
     """Replace each skewed count feature with its log1p version (raw dropped).
@@ -1792,17 +1809,34 @@ def drop_redundant_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def drop_identifier_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop pure identifiers: the review/business/user IDs and the NOAA station
+    id. They are merge keys needed up to this point but carry no EDA or
+    modelling value."""
+    df = df.copy()
+    before = list(df.columns)
+    cols = [c for c in ID_COLS + ["station"] if c in df.columns]
+    df = df.drop(columns=cols)
+    report_feature_change("drop_identifier_columns", before, df.columns)
+    return df
+
+
 def build_model_dataset(df: pd.DataFrame) -> pd.DataFrame:
     """
     EDA-informed transition from the EDA dataset to the modelling dataset:
-      1. drop the redundant features (justified by the correlation/VIF tables),
-      2. show the skewness comparison for the features we keep, then
-      3. log-and-replace those skewed counts.
+      1. drop pure identifiers (IDs + station) now that all merges are done,
+      2. drop the redundant features (justified by the correlation/VIF tables),
+      3. show the skewness comparison for the features we keep, then
+      4. log-and-replace those skewed counts.
+
+    (Low-signal features such as weather_available are removed earlier, before
+    EDA, so they don't appear in the EDA tables.)
 
     Dropping first means we never transform a feature we won't use, and the
     skewness comparison only covers the features that survive into the model.
     """
     print_section("Building modelling dataset (post-EDA feature decisions)")
+    df = drop_identifier_columns(df)
     df = drop_redundant_features(df)
     run_skewness_comparison(df)
     df = log_and_replace_skewed(df)
@@ -1908,8 +1942,9 @@ def build_preprocessor(
     - Categorical: constant 'Unknown' imputation, then one-hot encoding with
       handle_unknown='ignore' so unseen categories at test time are safe.
 
-    weather_available stays in the numeric block, so the model can still tell
-    weather-covered rows apart from imputed ones.
+    Weather NaNs are median-imputed here. (The weather_available missing-
+    indicator was dropped earlier for ~0 signal; if reinstated, it would ride
+    along in the numeric block so the model could tell imputed rows apart.)
     """
     numeric, categorical = split_feature_types(X)
 
@@ -1960,11 +1995,19 @@ PLOT_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_SAMPLE_N = 100_000
 
 
-# Light cross-validation for stability. Off by default because k-fold on
-# millions of rows is slow; when on, it runs on a stratified subsample.
-DO_CV = False
+# Light cross-validation for stability. Runs on a stratified subsample.
+DO_CV = True
 CV_FOLDS = 3
 CV_SUBSAMPLE = 300_000
+
+# Focused hyperparameter search on the top models (HGB + random forest), and a
+# permutation-importance plot across all models. Both are extra work, so they
+# run on subsamples; set the DO_ flags to False to skip.
+DO_GRID_SEARCH = True
+GRID_SAMPLE = 30_000
+DO_FEATURE_IMPORTANCE = True
+PERM_SAMPLE = 3_000      # rows used for permutation importance (KNN is the bottleneck)
+PERM_REPEATS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -2094,15 +2137,22 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "decision_tree": Pipeline([
             ("pre", ordinal_pre),
+            # min_samples_leaf raised to curb the overfitting seen in the
+            # train-vs-test gap (a single tree memorises small leaves otherwise).
             ("model", DecisionTreeClassifier(
                 max_depth=12,
+                min_samples_leaf=50,
                 class_weight="balanced",
                 random_state=RANDOM_STATE,
             )),
         ]),
         "bagging": Pipeline([
             ("pre", ordinal_pre),
+            # Default bagging uses unpruned trees -> train ROC-AUC = 1.0. Bound
+            # the base tree's depth and leaf size so it generalises instead of
+            # memorising.
             ("model", BaggingClassifier(
+                estimator=DecisionTreeClassifier(max_depth=16, min_samples_leaf=50),
                 n_estimators=50,
                 n_jobs=-1,
                 random_state=RANDOM_STATE,
@@ -2110,8 +2160,12 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "random_forest": Pipeline([
             ("pre", ordinal_pre),
+            # max_depth + min_samples_leaf added for the same reason: the
+            # unconstrained forest hit train ROC-AUC = 1.0 (severe overfitting).
             ("model", RandomForestClassifier(
                 n_estimators=200,
+                max_depth=16,
+                min_samples_leaf=50,
                 class_weight="balanced",
                 n_jobs=-1,
                 random_state=RANDOM_STATE,
@@ -2133,13 +2187,21 @@ def build_models(X_train: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 
 def compute_metrics(y_true, y_pred, y_score) -> dict:
-    """Classification metrics suited to an imbalanced binary target."""
+    """Classification metrics suited to an imbalanced binary target.
+
+    The plain precision/recall/f1 are for the positive (satisfied = 1) class;
+    the *_dissat versions are the same metrics for the minority dissatisfied
+    (= 0) class, which the majority-class metrics hide.
+    """
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
+        "precision_dissat": precision_score(y_true, y_pred, pos_label=0, zero_division=0),
+        "recall_dissat": recall_score(y_true, y_pred, pos_label=0, zero_division=0),
+        "f1_dissat": f1_score(y_true, y_pred, pos_label=0, zero_division=0),
         "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
     }
     if y_score is not None:
@@ -2165,9 +2227,13 @@ def get_scores(model, X) -> np.ndarray | None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_holdout(models, X_train, X_test, y_train, y_test) -> tuple[pd.DataFrame, dict]:
-    """Fit each model on train, evaluate on the held-out test set."""
-    rows = []
+def evaluate_holdout(
+    models, X_train, X_test, y_train, y_test
+) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+    """Fit each model on train; return full metric tables for both the held-out
+    test set and the training set. Returns (test_results, fitted, train_results)."""
+    test_rows = []
+    train_rows = []
     fitted = {}
 
     for name, model in models.items():
@@ -2175,15 +2241,14 @@ def evaluate_holdout(models, X_train, X_test, y_train, y_test) -> tuple[pd.DataF
         model.fit(X_train, y_train)
         fitted[name] = model
 
-        y_pred = model.predict(X_test)
-        y_score = get_scores(model, X_test)
+        test_rows.append({"model": name, **compute_metrics(
+            y_test, model.predict(X_test), get_scores(model, X_test))})
+        train_rows.append({"model": name, **compute_metrics(
+            y_train, model.predict(X_train), get_scores(model, X_train))})
 
-        row = {"model": name}
-        row.update(compute_metrics(y_test, y_pred, y_score))
-        rows.append(row)
-
-    results = pd.DataFrame(rows).sort_values("roc_auc", ascending=False).reset_index(drop=True)
-    return results, fitted
+    test_results = pd.DataFrame(test_rows).sort_values("roc_auc", ascending=False).reset_index(drop=True)
+    train_results = pd.DataFrame(train_rows).sort_values("roc_auc", ascending=False).reset_index(drop=True)
+    return test_results, fitted, train_results
 
 
 def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
@@ -2224,6 +2289,93 @@ def plot_confusion(model, X_test, y_test, name: str) -> None:
     print(f"  saved {path}")
 
 
+def run_grid_search(X_train, y_train) -> None:
+    """Focused hyperparameter search on the two strongest models (HGB + random
+    forest), on a subsample for speed. Prints best CV ROC-AUC and parameters."""
+    print_section("Hyperparameter search (top models, ROC-AUC, CV)")
+
+    if len(X_train) > GRID_SAMPLE:
+        Xs = X_train.sample(GRID_SAMPLE, random_state=RANDOM_STATE)
+        ys = y_train.loc[Xs.index]
+    else:
+        Xs, ys = X_train, y_train
+    print(f"Searching on {len(Xs):,} rows, {CV_FOLDS}-fold CV.")
+
+    pipes = build_models(Xs)
+    grids = {
+        "hist_gradient_boosting": {
+            "model__learning_rate": [0.05, 0.1],
+            "model__max_leaf_nodes": [31, 63],
+            "model__max_iter": [100, 200],
+        },
+        "random_forest": {
+            "model__max_depth": [12, 16, 20],
+            "model__min_samples_leaf": [20, 50],
+        },
+    }
+    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    for name, grid in grids.items():
+        print(f"\nSearching {name} ...")
+        search = GridSearchCV(pipes[name], grid, scoring="roc_auc", cv=cv, n_jobs=-1)
+        search.fit(Xs, ys)
+        print(f"  best CV ROC-AUC: {search.best_score_:.4f}")
+        print(f"  best params:     {search.best_params_}")
+
+
+def plot_feature_importance(fitted, X_test, y_test) -> None:
+    """Grouped bar chart of the top-10 features, with one bar per model.
+
+    Uses permutation importance (drop in ROC-AUC when a feature is shuffled),
+    the only importance measure comparable across all model types: coefficients
+    and tree impurities are not comparable, and KNN/NB/MLP expose neither.
+    Computed on a subsample for speed; the baseline is excluded (no features).
+    """
+    print_section("Permutation feature importance by model")
+
+    if len(X_test) > PERM_SAMPLE:
+        Xp = X_test.sample(PERM_SAMPLE, random_state=RANDOM_STATE)
+        yp = y_test.loc[Xp.index]
+    else:
+        Xp, yp = X_test, y_test
+    print(f"Computing on {len(Xp):,} rows, {PERM_REPEATS} repeats per feature "
+          f"(this can take a few minutes; KNN is the slowest)...")
+
+    importances = {}
+    for name, model in fitted.items():
+        if name == "baseline_most_frequent":
+            continue
+        print(f"  importance: {name} ...")
+        result = permutation_importance(
+            model, Xp, yp, scoring="roc_auc",
+            n_repeats=PERM_REPEATS, random_state=RANDOM_STATE, n_jobs=-1,
+        )
+        importances[name] = pd.Series(result.importances_mean, index=Xp.columns).clip(lower=0)
+
+    imp_df = pd.DataFrame(importances)
+    top = imp_df.mean(axis=1).sort_values(ascending=False).head(10).index.tolist()
+    imp_df = imp_df.loc[top]
+
+    models_list = list(imp_df.columns)
+    n_models = len(models_list)
+    x = np.arange(len(top))
+    width = 0.8 / n_models
+    colors = plt.cm.tab10(np.linspace(0, 1, n_models))
+
+    plt.figure(figsize=(16, 8))
+    for i, mdl in enumerate(models_list):
+        offset = (i - n_models / 2) * width + width / 2
+        plt.bar(x + offset, imp_df[mdl].to_numpy(), width, label=mdl, color=colors[i])
+    plt.xticks(x, top, rotation=45, ha="right")
+    plt.ylabel("Permutation importance (drop in ROC-AUC)")
+    plt.title("Top 10 features: permutation importance by model")
+    plt.legend(ncol=3, fontsize=8, title="model")
+    plt.tight_layout()
+    path = PLOT_DIR / "feature_importance_by_model.png"
+    plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  saved {path}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -2242,21 +2394,36 @@ def models_main(df: pd.DataFrame) -> None:
 
     models = build_models(X_train)
 
-    print("\nEvaluating on held-out test set...")
-    results, fitted = evaluate_holdout(models, X_train, X_test, y_train, y_test)
+    print("\nEvaluating on training and held-out test sets...")
+    results, fitted, train_results = evaluate_holdout(models, X_train, X_test, y_train, y_test)
 
     print("\n" + "=" * 100)
     print("MODEL COMPARISON (held-out test set)")
     print("=" * 100)
-    with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
+    with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
         print(results.to_string(index=False))
-
     results.to_csv(OUTPUT_DIR / "model_comparison_holdout.csv", index=False)
     print(f"\nSaved: {OUTPUT_DIR / 'model_comparison_holdout.csv'}")
+
+    print("\n" + "=" * 100)
+    print("MODEL COMPARISON (training set)")
+    print("=" * 100)
+    with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
+        print(train_results.to_string(index=False))
+    print("\nCompare against the test table above: scores far higher on train")
+    print("than test = overfitting; both low and similar = underfitting.")
+    train_results.to_csv(OUTPUT_DIR / "model_comparison_train.csv", index=False)
+    print(f"Saved: {OUTPUT_DIR / 'model_comparison_train.csv'}")
 
     best_name = results.iloc[0]["model"]
     print(f"\nBest model by ROC-AUC (baseline-proof): {best_name}")
     plot_confusion(fitted[best_name], X_test, y_test, best_name)
+
+    if DO_FEATURE_IMPORTANCE:
+        plot_feature_importance(fitted, X_test, y_test)
+
+    if DO_GRID_SEARCH:
+        run_grid_search(X_train, y_train)
 
     if DO_CV:
         print("\nRunning light cross-validation (subsample)...")
@@ -2283,8 +2450,8 @@ def main() -> None:
     re-parsed each time. To force a rebuild, delete DATASET_PKL or set
     REBUILD = True.
     """
-    REBUILD = True
-    RUN_MODELS = False   # set True to also run the log transform + modelling
+    REBUILD = False
+    RUN_MODELS = True   # set True to also run the log transform + modelling
 
     if DATASET_PKL.exists() and not REBUILD:
         print(f"Loading existing dataset: {DATASET_PKL}")
@@ -2294,11 +2461,15 @@ def main() -> None:
         processed = process_data(tables)              # 2. clean / merge / sample
         enriched = build_weather_enriched(processed)  # 2b. + NOAA weather (saved)
 
+    # Remove features we won't use at all (e.g. the weather_available missing-
+    # indicator) before EDA, so they don't appear in the EDA tables either.
+    enriched = drop_low_signal_features(enriched)
+
     eda_main(enriched)                                # 3. EDA on the raw (untransformed) data
 
     # 4. EDA-informed transition (always runs, so the feature decisions are
-    #    visible even in an EDA-only run): log-and-replace the skewed counts,
-    #    then drop the redundant features from the correlation/VIF analysis.
+    #    visible even in an EDA-only run): drop identifiers + the redundant
+    #    features from the correlation/VIF analysis, then log-and-replace.
     model_df = build_model_dataset(enriched)
 
     if RUN_MODELS:
