@@ -2186,12 +2186,39 @@ def build_models(X_train: pd.DataFrame) -> dict:
 # Metrics
 # ---------------------------------------------------------------------------
 
+def top_decile_lift(y_true, y_score, fraction: float = 0.1, pos_label: int = 1) -> float:
+    """Lift in the top-scored fraction (default top decile): the rate of
+    `pos_label` among the highest-ranked `fraction` of cases divided by the
+    overall `pos_label` base rate. Lift = 1 is random; higher means the model
+    concentrates that class near the top of its ranking. A standard marketing/
+    CRM model-assessment metric.
+
+    For pos_label=1 (satisfied) cases are ranked by descending score; for
+    pos_label=0 (dissatisfied) by ascending score (lowest satisfied-score =
+    highest dissatisfied probability)."""
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score, dtype=float)
+    target = (y_true == pos_label)
+    base_rate = target.mean()
+    if base_rate == 0:
+        return np.nan
+    k = max(1, int(round(len(y_true) * fraction)))
+    order = np.argsort(y_score)
+    if pos_label == 1:
+        order = order[::-1]
+    top = target[order[:k]]
+    return float(top.mean() / base_rate)
+
+
 def compute_metrics(y_true, y_pred, y_score) -> dict:
     """Classification metrics suited to an imbalanced binary target.
 
     The plain precision/recall/f1 are for the positive (satisfied = 1) class;
     the *_dissat versions are the same metrics for the minority dissatisfied
-    (= 0) class, which the majority-class metrics hide.
+    (= 0) class, which the majority-class metrics hide. gini (= 2*AUC - 1) and
+    top_decile_lift are standard marketing-analytics ranking metrics;
+    top_decile_lift is for satisfied, top_decile_lift_dissat for the (more
+    actionable) dissatisfied minority.
     """
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
@@ -2205,11 +2232,18 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
         "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
     }
     if y_score is not None:
-        metrics["roc_auc"] = roc_auc_score(y_true, y_score)
+        roc = roc_auc_score(y_true, y_score)
+        metrics["roc_auc"] = roc
+        metrics["gini"] = 2 * roc - 1            # Gini = 2*AUC - 1 (rescaling of AUC)
         metrics["pr_auc"] = average_precision_score(y_true, y_score)
+        metrics["top_decile_lift"] = top_decile_lift(y_true, y_score, pos_label=1)
+        metrics["top_decile_lift_dissat"] = top_decile_lift(y_true, y_score, pos_label=0)
     else:
         metrics["roc_auc"] = np.nan
+        metrics["gini"] = np.nan
         metrics["pr_auc"] = np.nan
+        metrics["top_decile_lift"] = np.nan
+        metrics["top_decile_lift_dissat"] = np.nan
     return metrics
 
 
@@ -2322,31 +2356,32 @@ def run_grid_search(X_train, y_train) -> None:
         print(f"  best params:     {search.best_params_}")
 
 
-def plot_feature_importance(fitted, X_test, y_test) -> None:
-    """Grouped bar chart of the top-10 features, with one bar per model.
+def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
+    """Grouped horizontal bar chart of the top-10 features for the top-3 models.
 
-    Uses permutation importance (drop in ROC-AUC when a feature is shuffled),
-    the only importance measure comparable across all model types: coefficients
-    and tree impurities are not comparable, and KNN/NB/MLP expose neither.
-    Computed on a subsample for speed; the baseline is excluded (no features).
+    Features on the y-axis, permutation importance (drop in ROC-AUC when a
+    feature is shuffled) on the x-axis. Permutation importance is the only
+    importance measure comparable across model types; computed on a subsample
+    for speed. Only the three best models (by test ROC-AUC) are shown.
     """
-    print_section("Permutation feature importance by model")
+    print_section("Permutation feature importance (top 3 models)")
+
+    model_names = [m for m in top_models
+                   if m in fitted and m != "baseline_most_frequent"][:3]
 
     if len(X_test) > PERM_SAMPLE:
         Xp = X_test.sample(PERM_SAMPLE, random_state=RANDOM_STATE)
         yp = y_test.loc[Xp.index]
     else:
         Xp, yp = X_test, y_test
-    print(f"Computing on {len(Xp):,} rows, {PERM_REPEATS} repeats per feature "
-          f"(this can take a few minutes; KNN is the slowest)...")
+    print(f"Models: {model_names}")
+    print(f"Computing on {len(Xp):,} rows, {PERM_REPEATS} repeats per feature...")
 
     importances = {}
-    for name, model in fitted.items():
-        if name == "baseline_most_frequent":
-            continue
+    for name in model_names:
         print(f"  importance: {name} ...")
         result = permutation_importance(
-            model, Xp, yp, scoring="roc_auc",
+            fitted[name], Xp, yp, scoring="roc_auc",
             n_repeats=PERM_REPEATS, random_state=RANDOM_STATE, n_jobs=-1,
         )
         importances[name] = pd.Series(result.importances_mean, index=Xp.columns).clip(lower=0)
@@ -2355,20 +2390,20 @@ def plot_feature_importance(fitted, X_test, y_test) -> None:
     top = imp_df.mean(axis=1).sort_values(ascending=False).head(10).index.tolist()
     imp_df = imp_df.loc[top]
 
-    models_list = list(imp_df.columns)
-    n_models = len(models_list)
-    x = np.arange(len(top))
-    width = 0.8 / n_models
+    n_models = len(model_names)
+    y = np.arange(len(top))
+    height = 0.8 / n_models
     colors = plt.cm.tab10(np.linspace(0, 1, n_models))
 
-    plt.figure(figsize=(16, 8))
-    for i, mdl in enumerate(models_list):
-        offset = (i - n_models / 2) * width + width / 2
-        plt.bar(x + offset, imp_df[mdl].to_numpy(), width, label=mdl, color=colors[i])
-    plt.xticks(x, top, rotation=45, ha="right")
-    plt.ylabel("Permutation importance (drop in ROC-AUC)")
-    plt.title("Top 10 features: permutation importance by model")
-    plt.legend(ncol=3, fontsize=8, title="model")
+    plt.figure(figsize=(12, 8))
+    for i, mdl in enumerate(model_names):
+        offset = (i - n_models / 2) * height + height / 2
+        plt.barh(y + offset, imp_df[mdl].to_numpy(), height, label=mdl, color=colors[i])
+    plt.yticks(y, top)
+    plt.gca().invert_yaxis()                      # most important feature on top
+    plt.xlabel("Permutation importance (drop in ROC-AUC)")
+    plt.title("Top 10 features: permutation importance (top 3 models)")
+    plt.legend(title="model")
     plt.tight_layout()
     path = PLOT_DIR / "feature_importance_by_model.png"
     plt.savefig(path, dpi=200, bbox_inches="tight")
@@ -2394,46 +2429,50 @@ def models_main(df: pd.DataFrame) -> None:
 
     models = build_models(X_train)
 
-    print("\nEvaluating on training and held-out test sets...")
-    results, fitted, train_results = evaluate_holdout(models, X_train, X_test, y_train, y_test)
+    # ---- Training-phase work first: nothing here touches the test set. ----
+    if DO_CV:
+        print("\nRunning light cross-validation (training subsample)...")
+        cv_results = run_cross_validation(models, X_train, y_train)
+        print("\n" + "=" * 100)
+        print(f"CROSS-VALIDATION ({CV_FOLDS}-fold, training subsample)")
+        print("=" * 100)
+        with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
+            print(cv_results.to_string(index=False))
+        cv_results.to_csv(OUTPUT_DIR / "model_comparison_cv.csv", index=False)
 
-    print("\n" + "=" * 100)
-    print("MODEL COMPARISON (held-out test set)")
-    print("=" * 100)
-    with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
-        print(results.to_string(index=False))
-    results.to_csv(OUTPUT_DIR / "model_comparison_holdout.csv", index=False)
-    print(f"\nSaved: {OUTPUT_DIR / 'model_comparison_holdout.csv'}")
+    if DO_GRID_SEARCH:
+        run_grid_search(X_train, y_train)
+
+    # ---- Fit on train; report training-set performance. ----
+    print("\nFitting models and evaluating on training and held-out test sets...")
+    results, fitted, train_results = evaluate_holdout(models, X_train, X_test, y_train, y_test)
 
     print("\n" + "=" * 100)
     print("MODEL COMPARISON (training set)")
     print("=" * 100)
     with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
         print(train_results.to_string(index=False))
-    print("\nCompare against the test table above: scores far higher on train")
-    print("than test = overfitting; both low and similar = underfitting.")
     train_results.to_csv(OUTPUT_DIR / "model_comparison_train.csv", index=False)
     print(f"Saved: {OUTPUT_DIR / 'model_comparison_train.csv'}")
 
+    # ---- Held-out test set: the final measurement, touched last. ----
+    print("\n" + "=" * 100)
+    print("MODEL COMPARISON (held-out test set)")
+    print("=" * 100)
+    with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
+        print(results.to_string(index=False))
+    print("\nCompare against the training table above: scores far higher on train")
+    print("than test = overfitting; both low and similar = underfitting.")
+    results.to_csv(OUTPUT_DIR / "model_comparison_holdout.csv", index=False)
+    print(f"Saved: {OUTPUT_DIR / 'model_comparison_holdout.csv'}")
+
+    # ---- Interpretation of the final model(s) on the test set. ----
     best_name = results.iloc[0]["model"]
     print(f"\nBest model by ROC-AUC (baseline-proof): {best_name}")
     plot_confusion(fitted[best_name], X_test, y_test, best_name)
 
     if DO_FEATURE_IMPORTANCE:
-        plot_feature_importance(fitted, X_test, y_test)
-
-    if DO_GRID_SEARCH:
-        run_grid_search(X_train, y_train)
-
-    if DO_CV:
-        print("\nRunning light cross-validation (subsample)...")
-        cv_results = run_cross_validation(models, X_train, y_train)
-        print("\n" + "=" * 100)
-        print(f"CROSS-VALIDATION ({CV_FOLDS}-fold, subsample)")
-        print("=" * 100)
-        with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
-            print(cv_results.to_string(index=False))
-        cv_results.to_csv(OUTPUT_DIR / "model_comparison_cv.csv", index=False)
+        plot_feature_importance(fitted, X_test, y_test, results["model"].head(3).tolist())
 
     print("\nModel comparison completed.")
 
@@ -2451,7 +2490,7 @@ def main() -> None:
     REBUILD = True.
     """
     REBUILD = False
-    RUN_MODELS = True   # set True to also run the log transform + modelling
+    RUN_MODELS = False   # set True to also run the log transform + modelling
 
     if DATASET_PKL.exists() and not REBUILD:
         print(f"Loading existing dataset: {DATASET_PKL}")

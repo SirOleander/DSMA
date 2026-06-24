@@ -1,0 +1,142 @@
+Module: Financial Instruments (Stocks, Bonds, Derivatives and Hedge Funds)
+Main Objective: Build a stock selection model using financial reports.
+Tasks:
+
+1. Prepare the Data
+	- Stock tickers
+	- Financial reports
+	- Report release dates
+	- Stock price data
+
+2. Extract Report Signals
+	- Use continuous 0–1 percentile scores for financial metrics.
+	- Use 1–5 rubric scores for qualitative report signals.
+	- Normalize both to 0–1.
+	- Combine them into one sector competitive advantage score.
+	- Financials:
+		- ROIC = (EBIT x (1 - Tax Rate)) / (Total Debt + Total Equity - Cash and Cash Equivalents)
+		- Revenue Growth = (Revenue_t - Revenue_t-1) / Revenue_t-1
+		- Gross Margin = Gross Profit / Revenue
+		- Gross Margin Strength = standard deviation of Gross Margin over last 3–5 years
+		- Operating Margin = Operating Income / Revenue
+		- Free Cash Flow = Operating Cash Flow - Capital Expenditure
+
+	- Sectors:
+		- Banks
+ 			- Financials
+    				- Capital Strength
+    				- Credit Quality
+    				- Efficiency Ratio
+    				- Net Interest Margin
+    				- ROE
+ 			- Operative
+    				- Customer franchise strength
+    				- Deposit / funding advantage
+    				- Regulatory trust
+    				- Risk management quality
+    				- Scale and market position
+		- Communication
+  			- Financials
+    				- Free cash flow margin
+    				- Operating margin
+    				- Revenue growth
+    				- ROIC
+    				- User monetization / ARPU growth
+  			- Operative
+    				- Advertising / subscription power
+    				- Content or data advantage
+    				- Customer engagement
+    				- Network effects
+    				- Platform strength
+		- Consumer Discretionary
+  			- Financials
+    				- Free cash flow margin
+    				- Gross margin
+    				- Inventory / asset efficiency
+    				- Operating margin
+    				- Revenue growth
+  		- Operative
+    			- Brand strength
+    			- Customer loyalty
+    			- Digital or logistics advantage
+    			- Pricing power
+    			- Scale / distribution advantage
+	- Consumer Staples
+  		- Financials
+    			- Free cash flow stability
+    			- Gross margin stability
+    			- Operating margin stability
+    			- Revenue stability
+    			- ROIC
+		- Operative
+    			- Brand strength
+    			- Demand stability
+    			- Distribution strength
+    			- Pricing power
+    			- Retailer / supplier bargaining power
+	- Energy
+  		- Financials
+    			- Capital expenditure discipline
+    			- Debt strength
+    			- Free cash flow yield / margin
+    			- Operating margin
+    			- ROCE
+  		- Operative
+    			- Asset quality
+    			- Capital discipline
+    			- Cost position
+    			- Regulatory position
+    			- Reserve / resource quality
+	- Financial Services
+  		- Financials
+    			- Fee / Premium / Transaction Growth
+    			- Free Cash Flow Margin
+    			- Operating Margin
+    			- Revenue Stability
+    			- ROIC
+  		- Operative
+    			- Brand and trust
+    			- Customer / client stickiness
+    			- Network effects
+    			- Risk / underwriting / platform quality
+    			- Scale advantage
+	- Healthcare
+  		- Financials
+    			- Free cash flow margin
+    			- Operating margin
+    			- R&D efficiency
+    			- Revenue growth
+    			- ROIC
+  		- Operative
+    			- Diversification of products
+    			- Innovation / IP strength
+    			- Market leadership in therapies or devices
+    			- Patent / regulatory protection
+    			- Pipeline strength
+	- Industrials
+  		- Financials
+    			- Backlog / order growth
+    			- Free cash flow margin
+    			- Operating margin
+    			- Revenue growth
+    			- ROIC
+  		- Operative
+    			- Contract quality
+    			- Customer / contract stickiness
+    			- Operational efficiency
+    			- Pricing power
+    			- Scale advantage
+	- Technology
+  		- Financials
+    			- Free cash flow margin
+    			- Gross margin strength
+    			- Operating margin strength
+    			- Revenue growth
+    			- ROIC
+
+  		- Operative
+    			- Ecosystem or platform lock-in
+    			- Innovation / R&D strength
+    			- Market share leadership
+    			- Product differentiation
+    			- Technological leadership
