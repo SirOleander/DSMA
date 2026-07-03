@@ -16,6 +16,7 @@ NOAA weather download (so reruns don't re-download). Plots and the model-metrics
 table are written to the output folders.
 """
 
+import ast
 import json
 from pathlib import Path
 from time import sleep
@@ -132,6 +133,15 @@ WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 
 # Global random seed (single source of truth).
 RANDOM_STATE = 42
+
+# Script-level run lever. "full_pipeline" preserves the normal end-to-end
+# workflow; "inspect_yelp_features" stops after building a fuller Yelp-only
+# review-level dataset and writing a feature inventory.
+RUN_MODE = "inspect_yelp_features"
+
+SAVE_FULL_YELP_INSPECTION_DATASET = False
+YELP_FEATURE_INVENTORY_CSV = PROCESSED_DATA_DIR / "yelp_full_feature_inventory.csv"
+YELP_FULL_INSPECTION_PKL = PROCESSED_DATA_DIR / "yelp_full_merged_inspection.pkl"
 
 
 # ================================================================================
@@ -312,6 +322,8 @@ CATEGORICAL_COLUMNS = [
     "attributes.NoiseLevel",
     "attributes.RestaurantsGoodForGroups",
     "attributes.RestaurantsTableService",
+    "attributes.Caters",
+    "attributes.RestaurantsAttire",
 ]
 
 # Count columns whose missing values genuinely mean "no record" -> fill with 0.
@@ -326,6 +338,220 @@ COUNT_COLUMNS = [
     "photo_menu",
     "photo_outside",
 ]
+
+# Business-level subfeature extraction. Category dummies are limited to the most
+# common categories (excluding the universal "Restaurants" tag) so the
+# review-level modelling table stays tractable.
+CATEGORY_DUMMY_TOP_N = 30
+EXCLUDED_CATEGORY_DUMMIES = {"Restaurants"}
+
+ATTRIBUTE_SUBFEATURES = {
+    "attributes.Ambience": "ambience",
+    "attributes.BusinessParking": "parking",
+    "attributes.GoodForMeal": "meal",
+}
+
+HOURS_DAYS = [
+    ("Monday", "monday"),
+    ("Tuesday", "tuesday"),
+    ("Wednesday", "wednesday"),
+    ("Thursday", "thursday"),
+    ("Friday", "friday"),
+    ("Saturday", "saturday"),
+    ("Sunday", "sunday"),
+]
+
+ENGINEERED_BUSINESS_PREFIXES = (
+    "category_",
+    "ambience_",
+    "parking_",
+    "meal_",
+    "hours_",
+)
+
+
+def is_engineered_business_feature(column: str) -> bool:
+    """Return True for business subfeatures created from nested/list fields."""
+    return column.startswith(ENGINEERED_BUSINESS_PREFIXES)
+
+
+def sanitize_feature_name(value: str) -> str:
+    """Convert a Yelp label/key into a readable snake_case feature suffix."""
+    chars = []
+    for char in str(value).lower():
+        chars.append(char if char.isalnum() else "_")
+    cleaned = "".join(chars).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned or "unknown"
+
+
+def split_categories(value) -> list[str]:
+    """Split Yelp's comma-separated categories field into clean labels."""
+    if pd.isna(value):
+        return []
+    return [
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip() and item.strip() != "None"
+    ]
+
+
+def parse_yelp_dict(value) -> dict:
+    """Parse Yelp dictionary-like attribute strings safely.
+
+    Yelp JSON exports sometimes contain nested dicts as strings with Python
+    booleans/None rather than JSON true/false/null, so ast.literal_eval is the
+    appropriate parser here.
+    """
+    if isinstance(value, dict):
+        return value
+    if pd.isna(value):
+        return {}
+    text = str(value).strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return {}
+    try:
+        parsed = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def add_category_dummies(business: pd.DataFrame) -> pd.DataFrame:
+    """Add top category/cuisine dummy variables to the business table."""
+    if "categories" not in business.columns:
+        return business
+
+    business = business.copy()
+    category_lists = business["categories"].map(split_categories)
+    counts = {}
+    for categories in category_lists:
+        for category in categories:
+            if category not in EXCLUDED_CATEGORY_DUMMIES:
+                counts[category] = counts.get(category, 0) + 1
+
+    top_categories = [
+        category
+        for category, _ in sorted(
+            counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:CATEGORY_DUMMY_TOP_N]
+    ]
+
+    used_columns = set(business.columns)
+    for category in top_categories:
+        base_name = f"category_{sanitize_feature_name(category)}"
+        column = base_name
+        suffix = 2
+        while column in used_columns:
+            column = f"{base_name}_{suffix}"
+            suffix += 1
+        used_columns.add(column)
+        business[column] = category_lists.map(
+            lambda values, c=category: int(c in values)
+        ).astype("int8")
+
+    return business
+
+
+def add_attribute_dummies(business: pd.DataFrame) -> pd.DataFrame:
+    """Expand selected nested Yelp attribute dictionaries into dummy columns."""
+    business = business.copy()
+
+    for source_col, prefix in ATTRIBUTE_SUBFEATURES.items():
+        if source_col not in business.columns:
+            continue
+
+        parsed = business[source_col].map(parse_yelp_dict)
+        keys = sorted({key for values in parsed for key in values})
+        for key in keys:
+            column = f"{prefix}_{sanitize_feature_name(key)}"
+            business[column] = parsed.map(
+                lambda values, k=key: int(values.get(k) is True)
+            ).astype("int8")
+
+    return business
+
+
+def parse_hours_range(value) -> tuple[int, float]:
+    """Parse a Yelp hours string into (is_open, duration_hours).
+
+    Yelp stores hours as strings like "7:0-21:0". Closing times earlier than
+    opening times mean the venue closes after midnight. "0:0-0:0" is treated as
+    24 hours open, which is Yelp's convention for all-day opening.
+    """
+    if pd.isna(value):
+        return 0, 0.0
+
+    text = str(value).strip()
+    if not text or "-" not in text:
+        return 0, 0.0
+
+    try:
+        open_text, close_text = text.split("-", 1)
+        open_hour, open_minute = [int(part) for part in open_text.split(":", 1)]
+        close_hour, close_minute = [int(part) for part in close_text.split(":", 1)]
+    except (TypeError, ValueError):
+        return 0, 0.0
+
+    open_minutes = open_hour * 60 + open_minute
+    close_minutes = close_hour * 60 + close_minute
+
+    if open_minutes == close_minutes:
+        return 1, 24.0
+
+    duration = close_minutes - open_minutes
+    if duration < 0:
+        duration += 24 * 60
+
+    return 1, duration / 60
+
+
+def add_hours_features(business: pd.DataFrame) -> pd.DataFrame:
+    """Create opening-hours features from flattened hours.* columns."""
+    hour_cols = [f"hours.{day}" for day, _ in HOURS_DAYS]
+    if not any(col in business.columns for col in hour_cols):
+        return business
+
+    business = business.copy()
+    duration_cols = []
+    open_cols = []
+
+    for day, day_key in HOURS_DAYS:
+        source_col = f"hours.{day}"
+        open_col = f"hours_open_{day_key}"
+        duration_col = f"hours_duration_{day_key}"
+        open_cols.append(open_col)
+        duration_cols.append(duration_col)
+
+        if source_col in business.columns:
+            parsed = business[source_col].map(parse_hours_range)
+            business[open_col] = parsed.map(lambda value: value[0]).astype("int8")
+            business[duration_col] = parsed.map(lambda value: value[1]).astype("float32")
+        else:
+            business[open_col] = np.int8(0)
+            business[duration_col] = np.float32(0.0)
+
+    weekend_duration_cols = ["hours_duration_saturday", "hours_duration_sunday"]
+    business["hours_open_days_count"] = business[open_cols].sum(axis=1).astype("int8")
+    business["hours_total_weekly_open_hours"] = business[duration_cols].sum(axis=1).astype("float32")
+    business["hours_weekend_open"] = (
+        business[["hours_open_saturday", "hours_open_sunday"]].sum(axis=1) > 0
+    ).astype("int8")
+    business["hours_weekend_open_hours"] = (
+        business[weekend_duration_cols].sum(axis=1).astype("float32")
+    )
+
+    return business
+
+
+def add_business_subfeatures(business: pd.DataFrame) -> pd.DataFrame:
+    """Create structured dummies from categories, nested attributes and hours."""
+    business = add_category_dummies(business)
+    business = add_attribute_dummies(business)
+    business = add_hours_features(business)
+    return business
 
 
 def prepare_core_tables(
@@ -406,6 +632,12 @@ def select_columns_before_merge(
         "attributes.NoiseLevel",
         "attributes.RestaurantsGoodForGroups",
         "attributes.RestaurantsTableService",
+        "attributes.Caters",
+        "attributes.RestaurantsAttire",
+    ]
+    business_columns += [
+        col for col in business.columns
+        if is_engineered_business_feature(col)
     ]
 
     review_columns = [
@@ -561,6 +793,9 @@ def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
     for col in COUNT_COLUMNS:
         if col in dataset.columns:
             dataset[col] = dataset[col].fillna(0)
+
+    for col in [c for c in dataset.columns if is_engineered_business_feature(c)]:
+        dataset[col] = pd.to_numeric(dataset[col], errors="coerce").fillna(0)
 
     for col in CATEGORICAL_COLUMNS:
         if col in dataset.columns:
@@ -905,6 +1140,15 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "attributes.NoiseLevel",
         "attributes.RestaurantsGoodForGroups",
         "attributes.RestaurantsTableService",
+        "attributes.Caters",
+        "attributes.RestaurantsAttire",
+
+        # Business subfeatures expanded from multi-label / nested fields.
+        # These are structured descriptors, created before the review merge.
+        *[
+            col for col in dataset.columns
+            if is_engineered_business_feature(col)
+        ],
 
         # User-level variables
         "user_review_count",
@@ -978,6 +1222,11 @@ def process_data(tables: dict) -> pd.DataFrame:
     )
     print("\n[prepare_core_tables] created target column 'satisfied' on reviews")
 
+    business_before = list(business.columns)
+    business = add_business_subfeatures(business)
+    report_feature_change("add_business_subfeatures [business]",
+                          business_before, business.columns)
+
     # First feature drop: keep only the columns we need from each table, before
     # the merge copies them across millions of rows.
     cols_before = {
@@ -1039,6 +1288,262 @@ def process_data(tables: dict) -> pd.DataFrame:
 
     print("\nProcessing completed.")
     return model_data
+
+
+def _rename_remaining_overlaps(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    merge_keys: list[str],
+    prefix: str,
+) -> pd.DataFrame:
+    """Rename non-key columns that would otherwise become *_x / *_y.
+
+    The known Yelp overlaps are handled by prepare_core_tables() using readable
+    project names such as review_stars and business_stars. This helper catches
+    any extra raw columns that overlap, preserving them for inspection without
+    creating ambiguous merge suffixes.
+    """
+    protected = set(merge_keys)
+    overlaps = (set(left.columns) & set(right.columns)) - protected
+    rename_map = {
+        col: f"{prefix}_{col}"
+        for col in overlaps
+        if not col.startswith(f"{prefix}_")
+    }
+    return right.rename(columns=rename_map)
+
+
+def create_tip_inspection_features(tip: pd.DataFrame) -> pd.DataFrame:
+    """Create one-row-per-business tip features for the inspection dataset."""
+    if tip.empty or "business_id" not in tip.columns:
+        return pd.DataFrame(columns=["business_id"])
+
+    tip = tip.copy()
+    if "text" in tip.columns:
+        tip["tip_text_length"] = tip["text"].fillna("").astype(str).str.len()
+
+    aggregations = {}
+    if "text" in tip.columns:
+        aggregations["tip_count"] = ("text", "count")
+    else:
+        aggregations["tip_count"] = ("business_id", "size")
+    if "compliment_count" in tip.columns:
+        aggregations["tip_compliment_count"] = ("compliment_count", "sum")
+    if "tip_text_length" in tip.columns:
+        aggregations["tip_text_length_mean"] = ("tip_text_length", "mean")
+        aggregations["tip_text_length_median"] = ("tip_text_length", "median")
+        aggregations["tip_text_length_max"] = ("tip_text_length", "max")
+    if "user_id" in tip.columns:
+        aggregations["tip_user_count"] = ("user_id", "nunique")
+    if "date" in tip.columns:
+        aggregations["tip_first_date"] = ("date", "min")
+        aggregations["tip_last_date"] = ("date", "max")
+
+    return tip.groupby("business_id").agg(**aggregations).reset_index()
+
+
+def create_photo_inspection_features(photo: pd.DataFrame) -> pd.DataFrame:
+    """Create one-row-per-business photo features, including label counts."""
+    if photo.empty or "business_id" not in photo.columns:
+        return pd.DataFrame(columns=["business_id"])
+
+    photo = photo.copy()
+    photo_id_col = "photo_id" if "photo_id" in photo.columns else "business_id"
+    photo_features = photo.groupby("business_id").agg(
+        photo_count=(photo_id_col, "count")
+    ).reset_index()
+
+    if "label" in photo.columns:
+        photo_label_features = (
+            photo.pivot_table(
+                index="business_id",
+                columns="label",
+                values=photo_id_col,
+                aggfunc="count",
+                fill_value=0,
+            )
+            .add_prefix("photo_")
+            .reset_index()
+        )
+        photo_features = photo_features.merge(
+            photo_label_features,
+            on="business_id",
+            how="left",
+        )
+
+    if "caption" in photo.columns:
+        photo["photo_caption_length"] = photo["caption"].fillna("").astype(str).str.len()
+        caption_features = photo.groupby("business_id").agg(
+            photo_caption_count=("caption", "count"),
+            photo_caption_length_mean=("photo_caption_length", "mean"),
+            photo_caption_length_max=("photo_caption_length", "max"),
+        ).reset_index()
+        photo_features = photo_features.merge(
+            caption_features,
+            on="business_id",
+            how="left",
+        )
+
+    return photo_features
+
+
+def build_full_yelp_inspection_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Build a full Yelp-only review-level dataset for feature discovery.
+
+    Unlike process_data(), this path does not select a narrow modelling feature
+    set before merging. It keeps the business/review/user tables broadly intact
+    and only aggregates one-to-many tables first so each output row remains one
+    review.
+    """
+    business = tables["business"]
+    reviews = tables["reviews"]
+    users = tables["users"]
+    checkin = tables["checkin"]
+    tip = tables["tip"]
+    photo = tables["photo"]
+
+    business, reviews, users = prepare_core_tables(
+        business=business,
+        reviews=reviews,
+        users=users,
+    )
+    if "review_text" in reviews.columns and "review_text_length" not in reviews.columns:
+        reviews = reviews.copy()
+        reviews["review_text_length"] = reviews["review_text"].fillna("").str.len()
+
+    business = add_business_subfeatures(business)
+
+    business = _rename_remaining_overlaps(
+        left=reviews,
+        right=business,
+        merge_keys=["business_id"],
+        prefix="business",
+    )
+    users = _rename_remaining_overlaps(
+        left=reviews,
+        right=users,
+        merge_keys=["user_id"],
+        prefix="user",
+    )
+
+    checkin_features = create_checkin_features(checkin)
+    tip_features = create_tip_inspection_features(tip)
+    photo_features = create_photo_inspection_features(photo)
+
+    print("\nBuilding full Yelp inspection dataset...")
+    rows_before = len(reviews)
+    dataset = reviews.merge(business, on="business_id", how="left")
+    dataset = dataset.merge(users, on="user_id", how="left")
+    dataset = dataset.merge(checkin_features, on="business_id", how="left")
+    dataset = dataset.merge(tip_features, on="business_id", how="left")
+    dataset = dataset.merge(photo_features, on="business_id", how="left")
+
+    if len(dataset) != rows_before:
+        raise ValueError(
+            "Inspection merge changed the number of review rows. "
+            f"Expected {rows_before:,}, got {len(dataset):,}."
+        )
+
+    dataset = clean_values(dataset)
+    print(f"Full Yelp inspection dataset: {dataset.shape[0]:,} rows x "
+          f"{dataset.shape[1]:,} columns")
+    return dataset
+
+
+def is_nested_or_flattened_json_column(column: str) -> bool:
+    """Flag columns that look like JSON-normalized or nested Yelp fields."""
+    lower = column.lower()
+    return (
+        "." in column
+        or lower.startswith("attributes.")
+        or lower.startswith("hours.")
+        or lower.startswith("ambience.")
+        or "ambience" in lower
+        or "categories" in lower
+        or "businessparking" in lower
+        or "goodfor" in lower
+    )
+
+
+def classify_feature_family(column: str) -> str:
+    """Assign a human-readable feature family for the inspection inventory."""
+    lower = column.lower()
+
+    if column in ID_COLS or lower.endswith("_id"):
+        return "ID columns"
+    if lower.startswith("attributes.") or "ambience" in lower:
+        return "business attribute columns"
+    if lower.startswith("hours."):
+        return "hours columns"
+    if "categories" in lower:
+        return "category columns"
+    if lower.startswith("checkin"):
+        return "check-in columns"
+    if lower.startswith("tip"):
+        return "tip columns"
+    if lower.startswith("photo"):
+        return "photo columns"
+    if lower.startswith("review_") or column == TARGET:
+        return "review columns"
+    if lower.startswith("user_"):
+        return "user columns"
+    if (
+        lower.startswith("business_")
+        or column in {"is_open", "city", "state", "latitude", "longitude",
+                      "postal_code", "address"}
+    ):
+        return "business columns"
+    return "other columns"
+
+
+def _safe_nunique(series: pd.Series):
+    """Return nunique where practical; skip very large free-text columns."""
+    lower = series.name.lower()
+    if "text" in lower:
+        return np.nan
+    try:
+        return int(series.nunique(dropna=True))
+    except TypeError:
+        return np.nan
+
+
+def create_feature_inventory(df: pd.DataFrame) -> pd.DataFrame:
+    """Create a column-level feature inventory for the inspection dataset."""
+    rows = []
+    n_rows = len(df)
+    for column in df.columns:
+        missing_count = int(df[column].isna().sum())
+        rows.append({
+            "column": column,
+            "dtype": str(df[column].dtype),
+            "missing_count": missing_count,
+            "missing_percent": (missing_count / n_rows * 100) if n_rows else np.nan,
+            "n_unique": _safe_nunique(df[column]),
+            "feature_family": classify_feature_family(column),
+            "is_nested_or_flattened_json": is_nested_or_flattened_json_column(column),
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["feature_family", "column"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def inspect_yelp_features_main() -> None:
+    """Run only the Yelp ingestion and full feature-inspection workflow."""
+    print_section("Yelp feature inspection mode")
+    tables = load_raw_data()
+    dataset = build_full_yelp_inspection_dataset(tables)
+    inventory = create_feature_inventory(dataset)
+
+    print(f"\nDataset shape: {dataset.shape[0]:,} rows x "
+          f"{dataset.shape[1]:,} columns")
+    print(f"Feature inventory created for {len(inventory):,} columns.")
+
+    inventory.to_csv(YELP_FEATURE_INVENTORY_CSV, index=False)
+
+    if SAVE_FULL_YELP_INSPECTION_DATASET:
+        dataset.to_pickle(YELP_FULL_INSPECTION_PKL)
 
 
 # ================================================================================
@@ -1738,13 +2243,18 @@ def eda_main(df: pd.DataFrame) -> None:
 
 DATE_COL = "review_date"
 
-# Votes a review accumulates from OTHER users after it is posted. They are not
-# available at the moment a review is written, so under a "predict at posting
-# time" framing they are look-ahead leakage. Excluded by default; flip
-# include_review_votes=True only if you adopt a purely descriptive framing.
-REVIEW_VOTE_COLS = [
-    "review_useful", "review_funny", "review_cool",
-    "log_review_useful", "log_review_funny", "log_review_cool",
+# Variables observed only after the review is written. They are useful for EDA
+# or optional robustness checks, but excluded from the main structured model by
+# default because they are not available before/at the satisfaction outcome.
+POST_REVIEW_COLS = [
+    "review_text_length",
+    "log_review_text_length",
+    "review_useful",
+    "review_funny",
+    "review_cool",
+    "log_review_useful",
+    "log_review_funny",
+    "log_review_cool",
 ]
 
 # Features removed after EDA because of multicollinearity / VIF. Names are given
@@ -1848,7 +2358,7 @@ def build_model_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
 def select_features(
     df: pd.DataFrame,
-    include_review_votes: bool = False,
+    include_post_review_features: bool = False,
     include_city: bool = False,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
@@ -1856,32 +2366,62 @@ def select_features(
 
     Dropped: IDs, review_date, the leakage columns (review_stars,
     business_stars, user_average_stars), each raw count that has a log_ twin,
-    and -- by default -- the review-vote columns and the very high-cardinality
-    'city' column (state already captures the regional signal cleanly).
+    and -- by default -- post-review variables including review votes and
+    review text length, plus the very high-cardinality 'city' column (state
+    already captures the regional signal cleanly).
     """
     if TARGET not in df.columns:
         raise ValueError(f"Target column '{TARGET}' is missing.")
 
-    drop = set(ID_COLS) | {DATE_COL} | set(LEAKAGE_COLS)
+    drop_groups = {
+        "identifiers/date": set(ID_COLS) | {DATE_COL},
+        "target leakage": set(LEAKAGE_COLS),
+    }
+    drop = set().union(*drop_groups.values())
 
     # 'station' is the NOAA station id added by the weather merge: an
     # identifier and a near-duplicate of the high-cardinality 'city' we drop.
     drop.add("station")
+    drop_groups["weather station identifier"] = {"station"}
 
-    if not include_review_votes:
-        drop |= set(REVIEW_VOTE_COLS)
+    if not include_post_review_features:
+        drop_groups["post-review variables"] = set(POST_REVIEW_COLS)
+        drop |= drop_groups["post-review variables"]
 
     if not include_city:
         drop.add("city")
+        drop_groups["high-cardinality location"] = {"city"}
 
     # For every raw count with a log_ version, keep the log and drop the raw.
+    raw_with_log_twin = set()
     for col in list(df.columns):
         if f"log_{col}" in df.columns:
             drop.add(col)
+            raw_with_log_twin.add(col)
+    if raw_with_log_twin:
+        drop_groups["raw variables with log_ replacement"] = raw_with_log_twin
 
     drop.discard(TARGET)
 
     feature_cols = [c for c in df.columns if c not in drop and c != TARGET]
+    dropped_from_x = [c for c in df.columns if c in drop and c != TARGET]
+
+    print(f"\n[select_features] X columns: {df.shape[1] - 1} -> {len(feature_cols)}")
+    if dropped_from_x:
+        reported = set()
+        for reason, columns in drop_groups.items():
+            actual = [
+                col for col in df.columns
+                if col in columns and col in drop and col != TARGET and col not in reported
+            ]
+            if actual:
+                print(f"  - dropped ({reason}, {len(actual)}): {actual}")
+                reported.update(actual)
+        remaining = [col for col in dropped_from_x if col not in reported]
+        if remaining:
+            print(f"  - dropped (other, {len(remaining)}): {remaining}")
+    else:
+        print("  (no feature columns dropped)")
 
     X = df[feature_cols].copy()
 
@@ -2482,6 +3022,17 @@ def main() -> None:
     """
     REBUILD = False
     RUN_MODELS = True   # set True to also run the log transform + modelling
+
+    valid_run_modes = {"full_pipeline", "inspect_yelp_features"}
+    if RUN_MODE not in valid_run_modes:
+        raise ValueError(
+            f"Unknown RUN_MODE={RUN_MODE!r}. "
+            f"Choose one of {sorted(valid_run_modes)}."
+        )
+
+    if RUN_MODE == "inspect_yelp_features":
+        inspect_yelp_features_main()
+        return
 
     if DATASET_PKL.exists() and not REBUILD:
         print(f"Loading existing dataset: {DATASET_PKL}")
