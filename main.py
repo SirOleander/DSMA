@@ -26,6 +26,7 @@ import pandas as pd
 import requests
 import matplotlib.pyplot as plt
 
+from colorspace import qualitative_hcl
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate, GridSearchCV
 from sklearn.inspection import permutation_importance
 from sklearn.pipeline import Pipeline
@@ -134,12 +135,15 @@ WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 # Global random seed (single source of truth).
 RANDOM_STATE = 42
 
-# Script-level run lever. "full_pipeline" preserves the normal end-to-end
-# workflow; "inspect_yelp_features" stops after building a fuller Yelp-only
-# review-level dataset and writing a feature inventory.
-RUN_MODE = "inspect_yelp_features"
+# Script-level run lever.
+# - "full_pipeline" preserves the normal end-to-end workflow.
+# - "inspect_yelp_features" builds/loads the fuller Yelp-only review-level
+#   dataset and writes a feature inventory.
+# - "eda_full_yelp_inspection" loads that cached full Yelp dataset and runs EDA
+#   without reparsing/cleaning/merging the raw files each time.
+RUN_MODE = "eda_full_yelp_inspection"
 
-SAVE_FULL_YELP_INSPECTION_DATASET = False
+REBUILD_FULL_YELP_INSPECTION_DATASET = False
 YELP_FEATURE_INVENTORY_CSV = PROCESSED_DATA_DIR / "yelp_full_feature_inventory.csv"
 YELP_FULL_INSPECTION_PKL = PROCESSED_DATA_DIR / "yelp_full_merged_inspection.pkl"
 
@@ -202,6 +206,38 @@ def report_feature_change(step: str, before, after) -> None:
         print(f"  - dropped ({len(dropped)}): {dropped}")
     if not added and not dropped:
         print("  (no column changes)")
+
+
+def report_dropped_variable_table(
+    step: str,
+    before_df: pd.DataFrame,
+    after_columns,
+    max_rows: int = 100,
+) -> None:
+    """Print a table describing variables removed by a column-selection step."""
+    after_set = set(after_columns)
+    dropped = [col for col in before_df.columns if col not in after_set]
+
+    if not dropped:
+        return
+
+    n_rows = len(before_df)
+    rows = []
+    for col in dropped:
+        missing_count = int(before_df[col].isna().sum())
+        rows.append({
+            "variable": col,
+            "dtype": str(before_df[col].dtype),
+            "non_null_count": int(before_df[col].notna().sum()),
+            "missing_count": missing_count,
+            "missing_percent": round((missing_count / n_rows * 100), 2) if n_rows else np.nan,
+        })
+
+    print_table(
+        pd.DataFrame(rows),
+        f"Dropped-variable details [{step}]",
+        max_rows=max_rows,
+    )
 
 # ================================================================================
 # 1. IMPORT DATA  (parse raw pgAdmin JSON exports)
@@ -825,6 +861,318 @@ def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
 
     return dataset
 
+
+def plot_yearly_review_count_and_missingness(
+    dataset: pd.DataFrame,
+    output_dir: Path,
+    min_year_marker: int = MIN_REVIEW_YEAR,
+) -> None:
+    """
+    Plot yearly review volume and missingness before the year cutoff is applied.
+
+    This preprocessing diagnostic is intentionally run before filter_study_scope()
+    so the pre-2010 rows remain visible when justifying the cutoff.
+    """
+    if "review_year" not in dataset.columns:
+        print("Cannot plot yearly coverage because 'review_year' is missing.")
+        return
+
+    review_year = pd.to_numeric(dataset["review_year"], errors="coerce")
+    valid_years = review_year.notna()
+    if not valid_years.any():
+        print("Cannot plot yearly coverage because all review years are missing.")
+        return
+
+    coverage = dataset.loc[valid_years].copy()
+    coverage["review_year"] = review_year.loc[valid_years].astype(int)
+    row_missing_percent = coverage.isna().mean(axis=1) * 100
+
+    yearly = (
+        pd.DataFrame({
+            "review_year": coverage["review_year"],
+            "row_missing_percent": row_missing_percent,
+        })
+        .groupby("review_year", observed=True)
+        .agg(
+            review_count=("review_year", "size"),
+            missing_percent=("row_missing_percent", "mean"),
+        )
+        .reset_index()
+        .sort_values("review_year")
+    )
+
+    if yearly.empty:
+        print("No yearly review coverage data available to plot.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    palette = qualitative_hcl("Warm").colors(2)
+    count_color = palette[0]
+    missing_color = palette[1]
+
+    fig, ax_count = plt.subplots(figsize=(11, 6))
+    x_positions = np.arange(len(yearly))
+    bar_width = 0.4
+
+    ax_count.bar(
+        x_positions - bar_width / 2,
+        yearly["review_count"],
+        width=bar_width,
+        color=count_color,
+        label="Review count",
+    )
+    ax_count.set_xlabel("Review year")
+    ax_count.set_ylabel("Number of reviews")
+    ax_count.set_xticks(x_positions)
+    ax_count.set_xticklabels(yearly["review_year"].astype(str), rotation=45)
+
+    ax_missing = ax_count.twinx()
+    ax_missing.bar(
+        x_positions + bar_width / 2,
+        yearly["missing_percent"],
+        width=bar_width,
+        color=missing_color,
+        label="Average missing values per row (%)",
+    )
+    ax_missing.set_ylabel("Average missing values per row (%)")
+    ax_missing.set_ylim(0, 100)
+    ax_missing.set_yticks(np.arange(0, 101, 10))
+
+    handles_count, labels_count = ax_count.get_legend_handles_labels()
+    handles_missing, labels_missing = ax_missing.get_legend_handles_labels()
+    ax_count.legend(
+        handles_count + handles_missing,
+        labels_count + labels_missing,
+        loc="upper left",
+    )
+
+    plt.title("Yearly review count and missingness before study-scope filtering")
+    fig.tight_layout()
+
+    output_path = output_dir / "yearly_review_count_and_missingness.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved yearly review-count and missingness plot to: {output_path}")
+
+
+def plot_top_city_review_count_and_missingness(
+    dataset: pd.DataFrame,
+    output_dir: Path,
+    top_n: int = 15,
+    min_year: int = MIN_REVIEW_YEAR,
+) -> None:
+    """
+    Plot the city-state markets with the most review data before city filtering.
+
+    City names should already be standardized when this helper is called, so the
+    plot justifies the final city-scope decision using the same market names as
+    the research dataset.
+    """
+    required_columns = {"city", "state"}
+    missing_columns = required_columns - set(dataset.columns)
+    if missing_columns:
+        print(
+            "Cannot plot top city review coverage because these columns are missing: "
+            f"{sorted(missing_columns)}"
+        )
+        return
+
+    coverage = dataset.copy()
+    if "review_year" in coverage.columns:
+        review_year = pd.to_numeric(coverage["review_year"], errors="coerce")
+        coverage = coverage[review_year >= min_year].copy()
+
+    if coverage.empty:
+        print("No city review coverage data available to plot.")
+        return
+
+    city_label = (
+        coverage["city"].astype("string").fillna("Unknown").str.strip()
+        + ", "
+        + coverage["state"].astype("string").fillna("Unknown").str.strip()
+    )
+
+    city_coverage = (
+        pd.DataFrame({
+            "city_state": city_label,
+        })
+        .groupby("city_state", observed=True)
+        .size()
+        .reset_index(name="review_count")
+        .sort_values("review_count", ascending=False)
+        .head(top_n)
+        .sort_values("review_count")
+    )
+
+    if city_coverage.empty:
+        print("No top city review coverage data available to plot.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    colors = qualitative_hcl("Pastel1").colors(len(city_coverage))
+
+    fig, ax_count = plt.subplots(figsize=(11, 7))
+    y_positions = np.arange(len(city_coverage))
+
+    ax_count.barh(
+        y_positions,
+        city_coverage["review_count"],
+        color=colors,
+        label="Review count",
+    )
+    ax_count.set_xlabel("Number of reviews")
+    ax_count.set_ylabel("City-state market")
+    ax_count.set_yticks(y_positions)
+    ax_count.set_yticklabels(city_coverage["city_state"].astype(str))
+
+    research_scope_n = len(SELECTED_CITY_STATE_SCOPE)
+    if len(city_coverage) > research_scope_n:
+        boundary_y = len(city_coverage) - research_scope_n - 0.5
+        ax_count.axhline(
+            boundary_y,
+            color="0.25",
+            linestyle="--",
+            linewidth=1.2,
+        )
+        ax_count.text(
+            0.98,
+            boundary_y + 0.15,
+            f"Top {research_scope_n} research scope",
+            transform=ax_count.get_yaxis_transform(),
+            ha="right",
+            va="bottom",
+            color="0.25",
+        )
+
+    plt.title(
+        f"Top {len(city_coverage)} city-state markets by review count "
+        f"({min_year} onward, before city-scope filtering)"
+    )
+    fig.tight_layout()
+
+    output_path = output_dir / "top_city_review_count_and_missingness.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved top city review-count plot to: {output_path}")
+
+
+def plot_philadelphia_city_variants_before_standardization(
+    dataset: pd.DataFrame,
+    output_dir: Path,
+    top_n: int = 12,
+) -> None:
+    """
+    Plot non-standard raw city-name variants collapsed into Philadelphia.
+
+    This is a preprocessing diagnostic and must run before
+    standardize_city_names(), while the original raw city values are still
+    available for the paper's justification of the standardisation step.
+    """
+    if "city" not in dataset.columns:
+        print("Cannot plot Philadelphia city variants because 'city' is missing.")
+        return
+
+    philadelphia_variants = {
+        "Bala Cynwyd",
+        "Center City",
+        "Chestnut Hill",
+        "East Passyunk",
+        "Fishtown",
+        "Manayunk",
+        "Mount Airy",
+        "Mt Airy",
+        "Northern Liberties",
+        "Old City",
+        "Passyunk Square",
+        "Phialdelphia",
+        "Phila",
+        "PHILADELPHIA",
+        "philadelphia",
+        "Philadelphia ",
+        "Philadelphia",
+        "Philly",
+        "Queen Village",
+        "Rittenhouse",
+        "Rittenhouse Square",
+        "Roxborough",
+        "South Philadelphia",
+        "University City",
+    }
+    canonical_philadelphia_values = {
+        "Philadelphia",
+        "PHILADELPHIA",
+        "philadelphia",
+    }
+
+    raw_city = (
+        dataset["city"]
+        .astype("string")
+        .fillna("Unknown")
+        .str.strip()
+    )
+
+    non_standard_variants = raw_city[
+        raw_city.isin(philadelphia_variants)
+        & ~raw_city.isin(canonical_philadelphia_values)
+    ]
+    all_counts = non_standard_variants.value_counts()
+    counts = (
+        all_counts
+        .head(top_n)
+        .sort_values()
+    )
+
+    if counts.empty:
+        print("No non-standard Philadelphia city-name variants found before standardization.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    colors = qualitative_hcl("Pastel1").colors(len(counts))
+
+    plt.figure(figsize=(10, 6))
+    plt.barh(counts.index.astype(str), counts.values, color=colors)
+    plt.xlabel("Number of records")
+    plt.ylabel("Raw city value")
+    plt.title("Most frequent non-standard raw city-name variants mapped to Philadelphia")
+    plt.tight_layout()
+
+    output_path = output_dir / "philadelphia_city_variants_before_standardization.png"
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved Philadelphia city-variant plot to: {output_path}")
+
+    try:
+        from wordcloud import WordCloud
+    except ImportError:
+        print("Skipping Philadelphia city-variant wordcloud because wordcloud is not installed.")
+        return
+
+    wordcloud = WordCloud(
+        width=1400,
+        height=800,
+        background_color="white",
+        colormap="viridis",
+        random_state=RANDOM_STATE,
+    ).generate_from_frequencies(all_counts.to_dict())
+
+    plt.figure(figsize=(10, 6))
+    plt.imshow(wordcloud, interpolation="bilinear")
+    plt.axis("off")
+    plt.tight_layout(pad=0)
+
+    wordcloud_path = output_dir / "philadelphia_city_variants_wordcloud.png"
+    plt.savefig(wordcloud_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Saved Philadelphia city-variant wordcloud to: {wordcloud_path}")
+
+
 def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
     """
     Standardize obvious duplicate city names and spelling variants.
@@ -1229,10 +1577,10 @@ def process_data(tables: dict) -> pd.DataFrame:
 
     # First feature drop: keep only the columns we need from each table, before
     # the merge copies them across millions of rows.
-    cols_before = {
-        "business": list(business.columns),
-        "reviews": list(reviews.columns),
-        "users": list(users.columns),
+    tables_before_selection = {
+        "business": business,
+        "reviews": reviews,
+        "users": users,
     }
     business, reviews, users = select_columns_before_merge(
         business=business,
@@ -1240,9 +1588,14 @@ def process_data(tables: dict) -> pd.DataFrame:
         users=users,
     )
     after_tables = {"business": business, "reviews": reviews, "users": users}
-    for name, before in cols_before.items():
+    for name, before_df in tables_before_selection.items():
         report_feature_change(f"select_columns_before_merge [{name}]",
-                              before, after_tables[name].columns)
+                              before_df.columns, after_tables[name].columns)
+        report_dropped_variable_table(
+            f"select_columns_before_merge [{name}]",
+            before_df=before_df,
+            after_columns=after_tables[name].columns,
+        )
 
     review_sample = sample_reviews(reviews)
 
@@ -1268,9 +1621,25 @@ def process_data(tables: dict) -> pd.DataFrame:
     print("\nCleaning values...")
     clean_before = list(dataset.columns)
     dataset = clean_values(dataset)
+    plot_yearly_review_count_and_missingness(
+        dataset=dataset,
+        output_dir=PLOT_OUTPUT_DIR,
+        min_year_marker=MIN_REVIEW_YEAR,
+    )
+    plot_philadelphia_city_variants_before_standardization(
+        dataset=dataset,
+        output_dir=PLOT_OUTPUT_DIR,
+        top_n=12,
+    )
     dataset = standardize_city_names(dataset)
     report_feature_change("clean_values (+ standardize_city_names)",
                           clean_before, dataset.columns)
+    plot_top_city_review_count_and_missingness(
+        dataset=dataset,
+        output_dir=PLOT_OUTPUT_DIR,
+        top_n=15,
+        min_year=MIN_REVIEW_YEAR,
+    )
 
     print("\nFiltering study scope...")
     rows_before = len(dataset)
@@ -1279,9 +1648,14 @@ def process_data(tables: dict) -> pd.DataFrame:
           f"{rows_before:,} -> {len(dataset):,}")
 
     print("\nSelecting final columns...")
-    select_before = list(dataset.columns)
+    select_before = dataset
     model_data = select_model_columns(dataset)
-    report_feature_change("select_model_columns", select_before, model_data.columns)
+    report_feature_change("select_model_columns", select_before.columns, model_data.columns)
+    report_dropped_variable_table(
+        "select_model_columns",
+        before_df=select_before,
+        after_columns=model_data.columns,
+    )
 
     print("\nOptimizing dtypes...")
     model_data = optimize_dtypes(model_data)
@@ -1445,6 +1819,22 @@ def build_full_yelp_inspection_dataset(tables: dict[str, pd.DataFrame]) -> pd.Da
         )
 
     dataset = clean_values(dataset)
+    plot_yearly_review_count_and_missingness(
+        dataset=dataset,
+        output_dir=PLOT_OUTPUT_DIR,
+        min_year_marker=MIN_REVIEW_YEAR,
+    )
+    plot_philadelphia_city_variants_before_standardization(
+        dataset=dataset,
+        output_dir=PLOT_OUTPUT_DIR,
+        top_n=12,
+    )
+    plot_top_city_review_count_and_missingness(
+        dataset=standardize_city_names(dataset),
+        output_dir=PLOT_OUTPUT_DIR,
+        top_n=15,
+        min_year=MIN_REVIEW_YEAR,
+    )
     print(f"Full Yelp inspection dataset: {dataset.shape[0]:,} rows x "
           f"{dataset.shape[1]:,} columns")
     return dataset
@@ -1529,11 +1919,25 @@ def create_feature_inventory(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def load_or_build_full_yelp_inspection_dataset(rebuild: bool = False) -> pd.DataFrame:
+    """Load the cached full merged Yelp dataset, or build and cache it once."""
+    if YELP_FULL_INSPECTION_PKL.exists() and not rebuild:
+        print(f"Loading full Yelp inspection dataset: {YELP_FULL_INSPECTION_PKL}")
+        return pd.read_pickle(YELP_FULL_INSPECTION_PKL)
+
+    tables = load_raw_data()
+    dataset = build_full_yelp_inspection_dataset(tables)
+    dataset.to_pickle(YELP_FULL_INSPECTION_PKL)
+    print(f"Saved full Yelp inspection dataset: {YELP_FULL_INSPECTION_PKL}")
+    return dataset
+
+
 def inspect_yelp_features_main() -> None:
     """Run only the Yelp ingestion and full feature-inspection workflow."""
     print_section("Yelp feature inspection mode")
-    tables = load_raw_data()
-    dataset = build_full_yelp_inspection_dataset(tables)
+    dataset = load_or_build_full_yelp_inspection_dataset(
+        rebuild=REBUILD_FULL_YELP_INSPECTION_DATASET
+    )
     inventory = create_feature_inventory(dataset)
 
     print(f"\nDataset shape: {dataset.shape[0]:,} rows x "
@@ -1542,8 +1946,67 @@ def inspect_yelp_features_main() -> None:
 
     inventory.to_csv(YELP_FEATURE_INVENTORY_CSV, index=False)
 
-    if SAVE_FULL_YELP_INSPECTION_DATASET:
-        dataset.to_pickle(YELP_FULL_INSPECTION_PKL)
+
+def prepare_cached_full_yelp_for_eda(dataset: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply the research EDA scope to the cached full Yelp inspection dataset.
+
+    The cache keeps the broad 180-column merged data so raw import/clean/merge
+    does not repeat. This step then makes the actual research EDA dataset from
+    that cache and prints the dropped-variable audit table.
+    """
+    print_section("Preparing cached full Yelp dataset for EDA")
+
+    clean_before = list(dataset.columns)
+    dataset = standardize_city_names(dataset)
+    report_feature_change(
+        "standardize_city_names [cached full Yelp EDA]",
+        clean_before,
+        dataset.columns,
+    )
+
+    plot_top_city_review_count_and_missingness(
+        dataset=dataset,
+        output_dir=PLOT_OUTPUT_DIR,
+        top_n=15,
+        min_year=MIN_REVIEW_YEAR,
+    )
+
+    print("\nFiltering study scope...")
+    rows_before = len(dataset)
+    dataset = filter_study_scope(dataset)
+    print(f"\n[filter_study_scope] dropped ROWS, not columns: "
+          f"{rows_before:,} -> {len(dataset):,}")
+
+    print("\nSelecting final EDA columns...")
+    select_before = dataset
+    eda_dataset = select_model_columns(dataset)
+    report_feature_change(
+        "select_model_columns [cached full Yelp EDA]",
+        select_before.columns,
+        eda_dataset.columns,
+    )
+    report_dropped_variable_table(
+        "select_model_columns [cached full Yelp EDA]",
+        before_df=select_before,
+        after_columns=eda_dataset.columns,
+    )
+
+    print("\nOptimizing dtypes...")
+    return optimize_dtypes(eda_dataset)
+
+
+def eda_full_yelp_inspection_main() -> None:
+    """Run EDA from the cached full merged Yelp inspection dataset."""
+    print_section("EDA on full Yelp inspection dataset")
+    dataset = load_or_build_full_yelp_inspection_dataset(
+        rebuild=REBUILD_FULL_YELP_INSPECTION_DATASET
+    )
+    eda_dataset = prepare_cached_full_yelp_for_eda(dataset)
+    eda_main(eda_dataset)
+
+    print("\nDone.")
+    print(f"EDA dataset: {eda_dataset.shape[0]:,} rows x {eda_dataset.shape[1]} columns")
 
 
 # ================================================================================
@@ -1882,6 +2345,35 @@ KEY_NUMERIC_COLS = [
     "weather_temp_range",
 ]
 
+# Curated numeric variables for the main EDA correlation matrix. This keeps the
+# figure interpretable by excluding dummy-expanded category, ambience, parking,
+# meal, opening-hour, photo-label and review-vote variables.
+CORRELATION_FEATURES = [
+    TARGET,
+    "review_year",
+    "review_month",
+    "review_weekday",
+    "business_review_count",
+    "is_open",
+    "latitude",
+    "longitude",
+    "user_review_count",
+    "user_fans",
+    "user_cool",
+    "user_funny",
+    "user_useful",
+    "checkin_count",
+    "tip_count",
+    "tip_compliment_count",
+    "photo_count",
+    "weather_prcp",
+    "weather_snow",
+    "weather_snow_depth",
+    "weather_tmax",
+    "weather_tmin",
+    "weather_temp_range",
+]
+
 # |r| at or above this flags two predictors as redundant (multicollinearity).
 CORR_THRESHOLD = 0.8
 
@@ -2065,10 +2557,20 @@ def run_target_analysis(df: pd.DataFrame) -> None:
 def run_correlation_matrix(df: pd.DataFrame) -> None:
     print_section("Correlation matrix")
 
-    numeric_df = df.select_dtypes(include="number")
-    # Drop leakage columns so they don't dominate the matrix or the ranking.
-    leak = [c for c in LEAKAGE_COLS if c in numeric_df.columns]
-    numeric_df = numeric_df.drop(columns=leak)
+    missing_requested = [col for col in CORRELATION_FEATURES if col not in df.columns]
+    if missing_requested:
+        print("\nCurated correlation columns not found and therefore skipped:")
+        print(missing_requested)
+
+    available_requested = [col for col in CORRELATION_FEATURES if col in df.columns]
+    numeric_df = df[available_requested].select_dtypes(include="number")
+    non_numeric_requested = [
+        col for col in available_requested
+        if col not in numeric_df.columns
+    ]
+    if non_numeric_requested:
+        print("\nCurated correlation columns are not numeric and therefore skipped:")
+        print(non_numeric_requested)
 
     if TARGET not in numeric_df.columns or numeric_df.shape[1] < 2:
         print("Not enough numeric columns for a correlation matrix.")
@@ -2117,13 +2619,33 @@ def run_correlation_matrix(df: pd.DataFrame) -> None:
             max_rows=40,
         )
 
-    # 3. Full correlation matrix as a heatmap for the report.
+    # 3. Lower-triangle correlation matrix as a heatmap for the report. The
+    # upper triangle is hidden because it mirrors the lower triangle exactly.
+    corr_plot = corr.mask(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+    cmap = plt.get_cmap("coolwarm").copy()
+    cmap.set_bad(color="white")
+
     plt.figure(figsize=(12, 10))
-    plt.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+    plt.imshow(corr_plot, cmap=cmap, vmin=-1, vmax=1)
     plt.colorbar(label="Pearson correlation")
     plt.xticks(range(len(corr.columns)), corr.columns, rotation=90, fontsize=7)
     plt.yticks(range(len(corr.columns)), corr.columns, fontsize=7)
-    plt.title("Numeric feature correlation matrix")
+    for row_idx in range(corr_plot.shape[0]):
+        for col_idx in range(corr_plot.shape[1]):
+            value = corr_plot.iloc[row_idx, col_idx]
+            if pd.isna(value):
+                continue
+            text_color = "white" if abs(value) >= 0.5 else "black"
+            plt.text(
+                col_idx,
+                row_idx,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=6,
+            )
+    plt.title("Numeric feature correlation matrix (lower triangle)")
     save_current_plot("correlation_matrix.png")
 
 
@@ -3023,7 +3545,11 @@ def main() -> None:
     REBUILD = False
     RUN_MODELS = True   # set True to also run the log transform + modelling
 
-    valid_run_modes = {"full_pipeline", "inspect_yelp_features"}
+    valid_run_modes = {
+        "full_pipeline",
+        "inspect_yelp_features",
+        "eda_full_yelp_inspection",
+    }
     if RUN_MODE not in valid_run_modes:
         raise ValueError(
             f"Unknown RUN_MODE={RUN_MODE!r}. "
@@ -3032,6 +3558,10 @@ def main() -> None:
 
     if RUN_MODE == "inspect_yelp_features":
         inspect_yelp_features_main()
+        return
+
+    if RUN_MODE == "eda_full_yelp_inspection":
+        eda_full_yelp_inspection_main()
         return
 
     if DATASET_PKL.exists() and not REBUILD:

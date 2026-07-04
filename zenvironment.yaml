@@ -11,3 +11,4 @@ dependencies:
     - pandas 
     - pyflakes
     - scikit-learn
+    - colorspace
