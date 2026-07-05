@@ -2322,9 +2322,9 @@ PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # review_stars is shown for context only: the target is derived from it, so it
 # (and the other LEAKAGE_COLS) are excluded from the modelling correlation matrix.
 
-# Raw numeric variables summarised in the descriptive-statistics table. EDA runs
-# on untransformed data, so these are the original (skewed) counts - inspecting
-# them is what motivates the log transform applied afterwards.
+# Fallback raw numeric variables for the descriptive-statistics table. In the
+# normal EDA flow, the numeric summary is produced after the correlation/VIF
+# workflow and uses the reduced numeric EDA feature set instead.
 KEY_NUMERIC_COLS = [
     "review_text_length",
     "business_stars",
@@ -2345,37 +2345,57 @@ KEY_NUMERIC_COLS = [
     "weather_temp_range",
 ]
 
-# Curated numeric variables for the main EDA correlation matrix. This keeps the
-# figure interpretable by excluding dummy-expanded category, ambience, parking,
-# meal, opening-hour, photo-label and review-vote variables.
-CORRELATION_FEATURES = [
-    TARGET,
-    "review_year",
-    "review_month",
-    "review_weekday",
-    "business_review_count",
-    "is_open",
-    "latitude",
-    "longitude",
-    "user_review_count",
-    "user_fans",
-    "user_cool",
-    "user_funny",
-    "user_useful",
-    "checkin_count",
-    "tip_count",
-    "tip_compliment_count",
-    "photo_count",
-    "weather_prcp",
-    "weather_snow",
-    "weather_snow_depth",
-    "weather_tmax",
-    "weather_tmin",
-    "weather_temp_range",
-]
-
 # |r| at or above this flags two predictors as redundant (multicollinearity).
 CORR_THRESHOLD = 0.8
+
+# VIF above this threshold is treated as severe multicollinearity and removed
+# from the final EDA correlation plot. This is diagnostic only; the modelling
+# feature-selection logic below remains the single source of truth for models.
+VIF_THRESHOLD = 10.0
+
+# Binary indicators are candidates for closer review when they are both rare
+# and have almost no marginal relationship with satisfaction. This is a
+# conservative EDA flag, not a tuning step on the test set.
+EDA_DUMMY_LOW_PREVALENCE_PERCENT = 1.0
+EDA_DUMMY_LOW_ABS_TARGET_CORR = 0.01
+
+EDA_EXCLUDE_EXACT = (
+    set(ID_COLS)
+    | {
+        "station",
+        "review_date",
+        "review_text",
+        "tip_text",
+        "caption",
+        "review_text_length",
+        "log_review_text_length",
+        "review_useful",
+        "review_funny",
+        "review_cool",
+        "log_review_useful",
+        "log_review_funny",
+        "log_review_cool",
+    }
+    | set(LEAKAGE_COLS)
+)
+
+EDA_INTERPRETABILITY_KEEP_PRIORITY = {
+    "business_review_count": 0,
+    "user_review_count": 0,
+    "user_useful": 0,
+    "photo_count": 0,
+    "weather_tmax": 0,
+    "weather_temp_range": 0,
+}
+
+EDA_INTERPRETABILITY_DROP_PRIORITY = {
+    "weather_tmin": 90,
+    "user_funny": 90,
+    "user_cool": 90,
+    "checkin_count": 85,
+    "tip_count": 85,
+    "tip_compliment_count": 75,
+}
 
 
 # =============================================================================
@@ -2420,30 +2440,15 @@ def plot_bar(
 # Descriptive statistics
 # =============================================================================
 
-def run_descriptive_stats(df: pd.DataFrame) -> None:
-    print_section("Descriptive statistics")
-
+def run_dataset_overview(df: pd.DataFrame) -> None:
+    """Print whole-dataset EDA context without pretending every column is a predictor."""
+    print_section("Dataset overview")
     overview = pd.DataFrame([{
         "rows": df.shape[0],
         "columns": df.shape[1],
         "overall_satisfaction_rate_percent": round(df[TARGET].mean() * 100, 2),
     }])
     print_table(overview, "Dataset shape")
-
-    cols = available_columns(df, KEY_NUMERIC_COLS)
-    if cols:
-        summary = (
-            df[cols]
-            .describe(percentiles=[0.25, 0.50, 0.75])
-            .T
-            .reset_index()
-            .rename(columns={"index": "variable"})
-        )
-        print_table(
-            summary,
-            "Numeric summary (count, mean, std, min, quartiles, max)",
-            max_rows=50,
-        )
 
     missing = pd.DataFrame({
         "variable": df.columns,
@@ -2457,6 +2462,119 @@ def run_descriptive_stats(df: pd.DataFrame) -> None:
         print("\nNo missing values.")
     else:
         print_table(missing, "Variables with missing values", max_rows=25)
+
+
+def run_numeric_summary(
+    df: pd.DataFrame,
+    columns: list[str] | None = None,
+    title: str = "Numeric summary (reduced EDA feature set)",
+) -> None:
+    """Summarise only the numeric variables that are valid EDA/model candidates."""
+    print_section("Descriptive statistics")
+
+    if columns is None:
+        columns = KEY_NUMERIC_COLS
+
+    cols = available_columns(df, columns)
+    if not cols:
+        print("No numeric columns available for the descriptive-statistics table.")
+        return
+
+    summary = (
+        df[cols]
+        .describe(percentiles=[0.25, 0.50, 0.75])
+        .T
+        .reset_index()
+        .rename(columns={"index": "variable"})
+    )
+    print_table(summary, title, max_rows=max(50, len(cols)))
+
+
+def run_binary_summary(
+    df: pd.DataFrame,
+    columns: list[str],
+    title: str = "Binary indicator summary",
+) -> None:
+    """Summarise binary indicators by prevalence and marginal target correlation."""
+    print_section("Binary indicator descriptive statistics")
+
+    if not columns:
+        print("No binary indicator columns available.")
+        return
+
+    target_corr = pd.Series(dtype=float)
+    if TARGET in df.columns and pd.api.types.is_numeric_dtype(df[TARGET]):
+        target_corr = (
+            pd.concat([df[[TARGET]], df[columns]], axis=1)
+            .corr(numeric_only=True)[TARGET]
+            .drop(TARGET)
+        )
+
+    rows = []
+    for col in columns:
+        values = pd.to_numeric(df[col], errors="coerce")
+        prevalence = float(values.mean() * 100)
+        corr_value = target_corr.get(col, np.nan)
+        flags = []
+        if prevalence < EDA_DUMMY_LOW_PREVALENCE_PERCENT:
+            flags.append("rare")
+        if pd.notna(corr_value) and abs(corr_value) < EDA_DUMMY_LOW_ABS_TARGET_CORR:
+            flags.append("near-zero target correlation")
+        rows.append({
+            "variable": col,
+            "count": int(values.notna().sum()),
+            "prevalence_percent": round(prevalence, 2),
+            "correlation_with_satisfied": round(float(corr_value), 4) if pd.notna(corr_value) else np.nan,
+            "drop_flag": "; ".join(flags),
+        })
+
+    summary = pd.DataFrame(rows)
+    summary["abs_target_corr"] = summary["correlation_with_satisfied"].abs()
+    summary = summary.sort_values(
+        ["abs_target_corr", "prevalence_percent"],
+        ascending=[False, False],
+    ).drop(columns="abs_target_corr")
+    print_table(summary, title, max_rows=max(80, len(summary)))
+
+    flagged = summary[summary["drop_flag"] != ""]
+    print_table(
+        flagged,
+        "Binary indicators flagged as rare and/or near-zero target correlation",
+        max_rows=max(50, len(flagged)),
+    )
+
+
+def run_categorical_summary(df: pd.DataFrame) -> None:
+    """Summarise true categorical variables that are encoded later in pipelines."""
+    print_section("Categorical feature summary")
+
+    categorical_cols = [
+        col for col in CATEGORICAL_COLUMNS
+        if col in df.columns
+    ]
+    if not categorical_cols:
+        print("No true categorical columns found in the EDA dataset.")
+        return
+
+    rows = []
+    for col in categorical_cols:
+        values = df[col]
+        counts = values.value_counts(dropna=False)
+        top_value = counts.index[0] if not counts.empty else np.nan
+        top_count = int(counts.iloc[0]) if not counts.empty else 0
+        rows.append({
+            "variable": col,
+            "levels": int(values.nunique(dropna=False)),
+            "top_level": top_value,
+            "top_level_percent": round(top_count / len(values) * 100, 2) if len(values) else np.nan,
+            "missing_percent": round(float(values.isna().mean() * 100), 2),
+        })
+
+    print_table(
+        pd.DataFrame(rows).sort_values("levels", ascending=False),
+        "True categorical variables retained for model-pipeline encoding",
+        max_rows=50,
+    )
 
 
 # =============================================================================
@@ -2554,78 +2672,342 @@ def run_target_analysis(df: pd.DataFrame) -> None:
 # Correlation matrix (relevance + multicollinearity)
 # =============================================================================
 
-def run_correlation_matrix(df: pd.DataFrame) -> None:
-    print_section("Correlation matrix")
+def empty_multicollinearity_diagnostics() -> pd.DataFrame:
+    """Return the standard schema for EDA multicollinearity drop diagnostics."""
+    return pd.DataFrame(
+        columns=["variable", "reason", "correlated_with", "correlation", "vif", "step"]
+    )
 
-    missing_requested = [col for col in CORRELATION_FEATURES if col not in df.columns]
-    if missing_requested:
-        print("\nCurated correlation columns not found and therefore skipped:")
-        print(missing_requested)
 
-    available_requested = [col for col in CORRELATION_FEATURES if col in df.columns]
-    numeric_df = df[available_requested].select_dtypes(include="number")
-    non_numeric_requested = [
-        col for col in available_requested
-        if col not in numeric_df.columns
+def _drop_record(
+    variable: str,
+    reason: str,
+    step: str,
+    correlated_with: str | None = None,
+    correlation: float | None = None,
+    vif: float | None = None,
+) -> dict:
+    return {
+        "variable": variable,
+        "reason": reason,
+        "correlated_with": correlated_with,
+        "correlation": correlation,
+        "vif": vif,
+        "step": step,
+    }
+
+
+def _eda_candidate_exclusion_reason(column: str) -> str | None:
+    """Return why a numeric column is excluded from the EDA correlation matrix."""
+    if column == TARGET:
+        return "target shown separately; not treated as a predictor candidate"
+    if column in EDA_EXCLUDE_EXACT:
+        if column in ID_COLS or column == "station" or column.endswith("_id"):
+            return "identifier"
+        if column in LEAKAGE_COLS:
+            return "target leakage / contemporaneous rating signal"
+        if column in {"review_date"}:
+            return "date string"
+        if column in {"review_text", "tip_text", "caption"}:
+            return "raw text field"
+        return "post-review variable"
+    return None
+
+
+def is_binary_numeric_series(series: pd.Series) -> bool:
+    """Return True when a numeric series contains only 0/1 values."""
+    values = pd.to_numeric(series.dropna(), errors="coerce").dropna().unique()
+    if len(values) == 0:
+        return False
+    return set(values).issubset({0, 1})
+
+
+def select_eda_candidate_sets(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Select continuous numeric and binary indicator candidates for EDA diagnostics.
+
+    Invalid predictors (IDs, leakage, dates and post-review fields) are removed
+    first. Remaining numeric features are then split by measurement type: binary
+    indicators get prevalence/phi-correlation style diagnostics, while
+    continuous/count variables get numeric summaries and the main heatmap.
+    """
+    numeric = df.select_dtypes(include="number").copy()
+    drop_records = []
+    keep_columns = []
+
+    for col in numeric.columns:
+        reason = _eda_candidate_exclusion_reason(col)
+        if reason is None:
+            keep_columns.append(col)
+        elif col != TARGET:
+            drop_records.append(
+                _drop_record(
+                    variable=col,
+                    reason=f"Excluded before EDA correlation matrix: {reason}",
+                    step="candidate_screening",
+                )
+            )
+
+    candidates = numeric[keep_columns].copy()
+    unusable = []
+    for col in candidates.columns:
+        values = candidates[col]
+        if not values.notna().any():
+            unusable.append((col, "all values missing"))
+        elif values.nunique(dropna=True) <= 1:
+            unusable.append((col, "constant numeric variable"))
+
+    if unusable:
+        candidates = candidates.drop(columns=[col for col, _reason in unusable])
+        for col, reason in unusable:
+            drop_records.append(
+                _drop_record(
+                    variable=col,
+                    reason=f"Excluded before EDA correlation matrix: {reason}",
+                    step="candidate_screening",
+                )
+            )
+
+    diagnostics = pd.DataFrame(drop_records)
+    if diagnostics.empty:
+        diagnostics = empty_multicollinearity_diagnostics()
+
+    binary_cols = [
+        col for col in candidates.columns
+        if is_binary_numeric_series(candidates[col])
     ]
-    if non_numeric_requested:
-        print("\nCurated correlation columns are not numeric and therefore skipped:")
-        print(non_numeric_requested)
+    continuous_cols = [
+        col for col in candidates.columns
+        if col not in binary_cols
+    ]
+    return candidates[continuous_cols].copy(), candidates[binary_cols].copy(), diagnostics
 
-    if TARGET not in numeric_df.columns or numeric_df.shape[1] < 2:
-        print("Not enough numeric columns for a correlation matrix.")
-        return
 
-    corr = numeric_df.corr(numeric_only=True)
+def _interpretability_drop_score(column: str) -> int:
+    """Higher score means the variable is less preferred when redundancy exists."""
+    if column in EDA_INTERPRETABILITY_KEEP_PRIORITY:
+        return EDA_INTERPRETABILITY_KEEP_PRIORITY[column]
+    if column in EDA_INTERPRETABILITY_DROP_PRIORITY:
+        return EDA_INTERPRETABILITY_DROP_PRIORITY[column]
+    if column.startswith("log_"):
+        return 70
+    if column.startswith("photo_") and column != "photo_count":
+        return 80
+    if column.endswith("_range") or column.endswith("_ratio"):
+        return 65
+    if column.startswith(("is_", "has_")):
+        return 55
+    return 50
 
-    # 1. Relevance: how each numeric feature correlates with the target.
-    target_corr = (
-        corr[TARGET]
-        .drop(TARGET)
-        .rename("correlation_with_satisfied")
-        .reset_index()
-        .rename(columns={"index": "variable"})
+
+def _choose_redundant_variable_to_drop(feature_1: str, feature_2: str) -> tuple[str, str]:
+    """Deterministically choose the less interpretable variable in a high-r pair."""
+    scores = {
+        feature_1: _interpretability_drop_score(feature_1),
+        feature_2: _interpretability_drop_score(feature_2),
+    }
+    if scores[feature_1] != scores[feature_2]:
+        drop = max(scores, key=lambda col: (scores[col], col))
+    else:
+        drop = max(feature_1, feature_2)
+    keep = feature_2 if drop == feature_1 else feature_1
+    reason = (
+        f"Dropped redundant variable from a high-correlation pair; kept {keep} "
+        "by the deterministic interpretability/tie-break rule"
     )
-    target_corr["abs"] = target_corr["correlation_with_satisfied"].abs()
-    target_corr = (
-        target_corr.sort_values("abs", ascending=False).drop(columns="abs")
-    )
-    print_table(target_corr, "Correlation with target (satisfied)", max_rows=40)
+    return drop, reason
 
-    # 2. Multicollinearity: predictor pairs with |r| >= CORR_THRESHOLD.
-    predictors = corr.drop(index=TARGET, columns=TARGET)
-    names = predictors.columns.tolist()
+
+def remove_highly_correlated_variables(
+    numeric: pd.DataFrame,
+    threshold: float = CORR_THRESHOLD,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Remove one variable from each high-correlation pair using a stable rule."""
+    if numeric.shape[1] < 2:
+        return numeric.copy(), empty_multicollinearity_diagnostics(), pd.DataFrame()
+
+    corr = numeric.corr(numeric_only=True)
+    names = corr.columns.tolist()
     pairs = []
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
-            r = predictors.iloc[i, j]
-            if pd.notna(r) and abs(r) >= CORR_THRESHOLD:
+            r = corr.iloc[i, j]
+            if pd.notna(r) and abs(r) >= threshold:
                 pairs.append({
                     "feature_1": names[i],
                     "feature_2": names[j],
-                    "correlation": round(float(r), 3),
+                    "correlation": float(r),
+                    "abs_correlation": abs(float(r)),
                 })
 
     pairs_df = pd.DataFrame(pairs)
     if pairs_df.empty:
-        print(f"\nNo feature pairs with |correlation| >= {CORR_THRESHOLD}.")
-    else:
-        pairs_df = pairs_df.reindex(
-            pairs_df["correlation"].abs().sort_values(ascending=False).index
-        ).reset_index(drop=True)
-        print_table(
-            pairs_df,
-            f"Highly correlated feature pairs (|r| >= {CORR_THRESHOLD}) - candidates to drop",
-            max_rows=40,
+        return numeric.copy(), empty_multicollinearity_diagnostics(), pairs_df
+
+    pairs_df = pairs_df.sort_values(
+        ["abs_correlation", "feature_1", "feature_2"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+    dropped = set()
+    records = []
+    for row in pairs_df.itertuples(index=False):
+        feature_1 = row.feature_1
+        feature_2 = row.feature_2
+        if feature_1 in dropped or feature_2 in dropped:
+            continue
+
+        drop, reason = _choose_redundant_variable_to_drop(feature_1, feature_2)
+        keep = feature_2 if drop == feature_1 else feature_1
+        dropped.add(drop)
+        records.append(
+            _drop_record(
+                variable=drop,
+                reason=reason,
+                correlated_with=keep,
+                correlation=round(float(row.correlation), 3),
+                step="pairwise_correlation",
+            )
         )
 
-    # 3. Lower-triangle correlation matrix as a heatmap for the report. The
-    # upper triangle is hidden because it mirrors the lower triangle exactly.
+    reduced = numeric.drop(columns=sorted(dropped))
+    diagnostics = pd.DataFrame(records)
+    if diagnostics.empty:
+        diagnostics = empty_multicollinearity_diagnostics()
+    return reduced, diagnostics, pairs_df.drop(columns="abs_correlation")
+
+
+def calculate_vif(numeric: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate VIF for numeric predictors using least-squares regressions.
+
+    VIF measures multivariate collinearity: how well each predictor can be
+    reconstructed from all of the others. Median imputation is used here only
+    for the EDA diagnostic matrix; model imputation remains inside pipelines.
+    """
+    if numeric.shape[1] < 2:
+        return pd.DataFrame(columns=["variable", "VIF"])
+
+    work = numeric.copy()
+    work = work.loc[:, work.notna().any()]
+    constant = work.nunique(dropna=True)[lambda s: s <= 1].index.tolist()
+    if constant:
+        work = work.drop(columns=constant)
+    if work.shape[1] < 2:
+        return pd.DataFrame(columns=["variable", "VIF"])
+
+    work = work.fillna(work.median(numeric_only=True))
+    if len(work) > 200_000:
+        work = work.sample(200_000, random_state=RANDOM_STATE)
+
+    cols = work.columns.tolist()
+    matrix = work.to_numpy(dtype=float)
+    n_rows = len(matrix)
+
+    records = []
+    for j, col in enumerate(cols):
+        y = matrix[:, j]
+        others = np.delete(matrix, j, axis=1)
+        others = np.column_stack([np.ones(n_rows), others])
+        beta, *_ = np.linalg.lstsq(others, y, rcond=None)
+        residual = y - others @ beta
+        ss_res = float(residual @ residual)
+        ss_tot = float(((y - y.mean()) ** 2).sum())
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        r2 = min(max(r2, 0.0), 1.0)
+        vif_value = np.inf if r2 >= 0.9999 else 1.0 / (1.0 - r2)
+        records.append({"variable": col, "VIF": vif_value})
+
+    return pd.DataFrame(records).sort_values("VIF", ascending=False).reset_index(drop=True)
+
+
+def _format_vif_table(vif: pd.DataFrame) -> pd.DataFrame:
+    if vif.empty:
+        return vif
+
+    def _flag(v: float) -> str:
+        if v > 1000:
+            return "near-perfect dependency"
+        if v > 10:
+            return "severe (>10)"
+        if v > 5:
+            return "moderate (>5)"
+        return ""
+
+    return pd.DataFrame({
+        "variable": vif["variable"],
+        "VIF": vif["VIF"].map(lambda v: ">1000" if v > 1000 else f"{v:,.2f}"),
+        "flag": vif["VIF"].map(_flag),
+    })
+
+
+def iteratively_reduce_high_vif(
+    numeric: pd.DataFrame,
+    threshold: float = VIF_THRESHOLD,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Drop the highest-VIF variable until all remaining VIFs are acceptable."""
+    reduced = numeric.copy()
+    records = []
+
+    while reduced.shape[1] >= 2:
+        vif = calculate_vif(reduced)
+        if vif.empty:
+            break
+
+        high_vif = vif[vif["VIF"] > threshold]
+        if high_vif.empty:
+            break
+
+        high_vif = high_vif.assign(
+            drop_score=high_vif["variable"].map(_interpretability_drop_score)
+        )
+        high_vif = high_vif.sort_values(
+            ["VIF", "drop_score", "variable"],
+            ascending=[False, False, True],
+        )
+        row = high_vif.iloc[0]
+        variable = row["variable"]
+        records.append(
+            _drop_record(
+                variable=variable,
+                reason=f"VIF above {threshold:g}; removed highest-VIF variable",
+                vif=round(float(row["VIF"]), 3) if np.isfinite(row["VIF"]) else np.inf,
+                step="vif_reduction",
+            )
+        )
+        reduced = reduced.drop(columns=[variable])
+
+    final_vif = calculate_vif(reduced)
+    diagnostics = pd.DataFrame(records)
+    if diagnostics.empty:
+        diagnostics = empty_multicollinearity_diagnostics()
+    return reduced, diagnostics, final_vif
+
+
+def plot_reduced_correlation_matrix(
+    numeric: pd.DataFrame,
+    df: pd.DataFrame,
+    filename: str = "correlation_matrix.png",
+    title: str = "Reduced EDA feature-set correlation matrix (lower triangle)",
+) -> None:
+    """Plot the final lower-triangle correlation matrix after reduction."""
+    if numeric.shape[1] < 2:
+        print("Not enough reduced numeric columns for a correlation matrix plot.")
+        return
+
+    plot_df = numeric.copy()
+    if TARGET in df.columns and pd.api.types.is_numeric_dtype(df[TARGET]):
+        plot_df = pd.concat([df[[TARGET]], plot_df], axis=1)
+
+    corr = plot_df.corr(numeric_only=True)
     corr_plot = corr.mask(np.triu(np.ones(corr.shape, dtype=bool), k=1))
     cmap = plt.get_cmap("coolwarm").copy()
     cmap.set_bad(color="white")
 
-    plt.figure(figsize=(12, 10))
+    fig_size = max(10, min(18, 0.45 * len(corr.columns) + 6))
+    plt.figure(figsize=(fig_size, fig_size * 0.85))
     plt.imshow(corr_plot, cmap=cmap, vmin=-1, vmax=1)
     plt.colorbar(label="Pearson correlation")
     plt.xticks(range(len(corr.columns)), corr.columns, rotation=90, fontsize=7)
@@ -2645,101 +3027,160 @@ def run_correlation_matrix(df: pd.DataFrame) -> None:
                 color=text_color,
                 fontsize=6,
             )
-    plt.title("Numeric feature correlation matrix (lower triangle)")
-    save_current_plot("correlation_matrix.png")
+    plt.title(title)
+    save_current_plot(filename)
 
 
-# =============================================================================
-# Multicollinearity: Variance Inflation Factor
-# =============================================================================
+def run_reduced_correlation_vif_workflow(
+    df: pd.DataFrame,
+    candidates: pd.DataFrame,
+    feature_type: str,
+    plot_filename: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run target correlation, pairwise correlation, VIF and final heatmap."""
+    print_section(f"{feature_type} correlation and multicollinearity diagnostics")
 
-def run_vif(df: pd.DataFrame) -> None:
-    """
-    Variance Inflation Factor (VIF) for the numeric predictors.
+    print(f"\n{feature_type} candidates after screening: {candidates.shape[1]:,}")
+    if candidates.shape[1] < 2:
+        print(f"Not enough {feature_type.lower()} candidates for correlation/VIF diagnostics.")
+        return candidates, empty_multicollinearity_diagnostics()
 
-    VIF_i = 1 / (1 - R_i^2), where R_i^2 is from regressing predictor i on all
-    the other predictors. Equivalently it is the i-th diagonal element of the
-    inverse correlation matrix, which is how it is computed here (no extra
-    dependency). Unlike the pairwise table, VIF measures *multivariate*
-    collinearity: how well a feature is explained by the others combined, which
-    catches redundancy that no single pairwise correlation reveals.
+    if TARGET in df.columns and pd.api.types.is_numeric_dtype(df[TARGET]):
+        target_corr = (
+            pd.concat([df[[TARGET]], candidates], axis=1)
+            .corr(numeric_only=True)[TARGET]
+            .drop(TARGET)
+            .rename("correlation_with_satisfied")
+            .reset_index()
+            .rename(columns={"index": "variable"})
+        )
+        target_corr["abs"] = target_corr["correlation_with_satisfied"].abs()
+        target_corr = target_corr.sort_values("abs", ascending=False).drop(columns="abs")
+        print_table(
+            target_corr,
+            f"Correlation with target ({feature_type.lower()} candidates)",
+            max_rows=max(50, len(target_corr)),
+        )
 
-    Conventional thresholds (rules of thumb, not exact laws):
-      VIF > 5  -> moderate multicollinearity
-      VIF > 10 -> severe multicollinearity
-    """
-    print_section("Multicollinearity: variance inflation factor (VIF)")
+    reduced_corr, corr_drops, pairs_df = remove_highly_correlated_variables(
+        candidates,
+        threshold=CORR_THRESHOLD,
+    )
+    if pairs_df.empty:
+        print(f"\nNo {feature_type.lower()} pairs with |correlation| >= {CORR_THRESHOLD}.")
+    else:
+        display_pairs = pairs_df.copy()
+        display_pairs["correlation"] = display_pairs["correlation"].round(3)
+        print_table(
+            display_pairs,
+            f"Highly correlated {feature_type.lower()} pairs (|r| >= {CORR_THRESHOLD})",
+            max_rows=max(50, len(display_pairs)),
+        )
+    if not corr_drops.empty:
+        if feature_type == "Binary indicator":
+            removed = corr_drops[["variable"]].drop_duplicates().reset_index(drop=True)
+            print_table(
+                removed,
+                "Binary indicator variables removed by pairwise-correlation rule",
+                max_rows=max(50, len(removed)),
+            )
+        elif feature_type != "Continuous numeric":
+            print_table(
+                corr_drops,
+                f"{feature_type} variables removed by pairwise-correlation rule",
+                max_rows=max(50, len(corr_drops)),
+            )
 
-    numeric = df.select_dtypes(include="number").copy()
-    drop = [c for c in LEAKAGE_COLS + [TARGET] if c in numeric.columns]
-    numeric = numeric.drop(columns=drop)
+    vif_before = calculate_vif(reduced_corr)
+    print_table(
+        _format_vif_table(vif_before),
+        f"VIF after pairwise-correlation reduction ({feature_type.lower()})",
+        max_rows=max(60, len(vif_before)),
+    )
 
-    # VIF is undefined for all-NaN or constant columns; remove them first.
-    numeric = numeric.loc[:, numeric.notna().any()]
-    constant = numeric.nunique()[lambda s: s <= 1].index.tolist()
-    if constant:
-        numeric = numeric.drop(columns=constant)
-        print(f"Excluded constant columns: {constant}")
+    final_features, vif_drops, _ = iteratively_reduce_high_vif(
+        reduced_corr,
+        threshold=VIF_THRESHOLD,
+    )
+    if not vif_drops.empty:
+        if feature_type not in {"Continuous numeric", "Binary indicator"}:
+            print_table(
+                vif_drops,
+                f"{feature_type} variables removed by iterative VIF rule",
+                max_rows=max(50, len(vif_drops)),
+            )
 
-    if numeric.shape[1] < 2:
-        print("Not enough numeric predictors for VIF.")
-        return
+    print(
+        f"\nFinal reduced {feature_type.lower()} EDA feature set: "
+        f"{final_features.shape[1]:,} predictors"
+    )
 
-    # Median-impute so every predictor is complete for the regressions below.
-    numeric = numeric.fillna(numeric.median(numeric_only=True))
+    diagnostics = pd.concat([corr_drops, vif_drops], ignore_index=True)
+    diagnostics = diagnostics.reindex(
+        columns=["variable", "reason", "correlated_with", "correlation", "vif", "step"]
+    )
+    if feature_type == "Continuous numeric":
+        removed = diagnostics[["variable"]].drop_duplicates().reset_index(drop=True)
+        print_table(
+            removed,
+            "Continuous numeric variables removed by multicollinearity rule",
+            max_rows=max(80, len(removed)),
+        )
+    elif feature_type == "Binary indicator":
+        removed = diagnostics[["variable"]].drop_duplicates().reset_index(drop=True)
+        print_table(
+            removed,
+            "Binary indicator variables removed by multicollinearity rule",
+            max_rows=max(80, len(removed)),
+        )
+    else:
+        print_table(
+            diagnostics,
+            f"{feature_type} variables removed from the final {feature_type.lower()} matrix",
+            max_rows=max(80, len(diagnostics)),
+        )
 
-    # VIF is a structural property, so estimate it on a sample for speed on
-    # large data (the estimate is essentially identical to the full-data value).
-    if len(numeric) > 200_000:
-        numeric = numeric.sample(200_000, random_state=RANDOM_STATE)
+    plot_reduced_correlation_matrix(
+        final_features,
+        df,
+        filename=plot_filename,
+        title=f"Reduced {feature_type.lower()} EDA feature-set correlation matrix (lower triangle)",
+    )
+    return final_features, diagnostics
 
-    cols = numeric.columns.tolist()
-    matrix = numeric.to_numpy(dtype=float)
-    n_rows = len(matrix)
 
-    # VIF_i = 1 / (1 - R_i^2), with R_i^2 from regressing predictor i on the
-    # rest (intercept included). lstsq handles rank-deficiency gracefully: an
-    # exact dependency (e.g. a total = sum of its parts) drives R^2 -> 1 and so
-    # VIF -> infinity, which we report as a near-perfect dependency.
-    records = []
-    for j, col in enumerate(cols):
-        y = matrix[:, j]
-        others = np.delete(matrix, j, axis=1)
-        others = np.column_stack([np.ones(n_rows), others])  # intercept
-        beta, *_ = np.linalg.lstsq(others, y, rcond=None)
-        residual = y - others @ beta
-        ss_res = float(residual @ residual)
-        ss_tot = float(((y - y.mean()) ** 2).sum())
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        r2 = min(max(r2, 0.0), 1.0)
-        vif_value = np.inf if r2 >= 0.9999 else 1.0 / (1.0 - r2)
-        records.append({"variable": col, "VIF": vif_value})
+def run_eda_correlation_workflows(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    print_section("EDA feature screening")
 
-    vif = pd.DataFrame(records).sort_values("VIF", ascending=False).reset_index(drop=True)
+    continuous_candidates, binary_candidates, screening_drops = select_eda_candidate_sets(df)
+    total_numeric = df.select_dtypes(include="number").shape[1]
+    print(
+        f"\nNumeric columns: {total_numeric:,} | "
+        f"continuous/count candidates: {continuous_candidates.shape[1]:,} | "
+        f"binary indicator candidates: {binary_candidates.shape[1]:,}"
+    )
+    print_table(
+        screening_drops,
+        "Variables excluded before numeric/binary diagnostics",
+        max_rows=max(80, len(screening_drops)),
+    )
 
-    # Very large VIFs (> 1000) mean a (near-)exact linear dependency - e.g. a
-    # total equal to the sum of its parts, or a range = max - min. The exact
-    # magnitude is meaningless there, so we report it as a dependency rather
-    # than a number.
-    def _flag(v: float) -> str:
-        if v > 1000:
-            return "near-perfect dependency"
-        if v > 10:
-            return "severe (>10)"
-        if v > 5:
-            return "moderate (>5)"
-        return ""
+    final_continuous, _ = run_reduced_correlation_vif_workflow(
+        df=df,
+        candidates=continuous_candidates,
+        feature_type="Continuous numeric",
+        plot_filename="correlation_matrix.png",
+    )
+    final_binary, _ = run_reduced_correlation_vif_workflow(
+        df=df,
+        candidates=binary_candidates,
+        feature_type="Binary indicator",
+        plot_filename="binary_correlation_matrix.png",
+    )
 
-    display = pd.DataFrame({
-        "variable": vif["variable"],
-        "VIF": vif["VIF"].map(lambda v: ">1000" if v > 1000 else f"{v:,.2f}"),
-        "flag": vif["VIF"].map(_flag),
-    })
-
-    print_table(display, "VIF per predictor", max_rows=50)
-    print("\nRule of thumb: VIF > 5 = moderate, VIF > 10 = severe multicollinearity.")
-    print("'>1000' marks a near-exact linear dependency, e.g. a total equal to the")
-    print("sum of its parts (photo_count) or a range equal to max - min (temp_range).")
+    return final_continuous, final_binary
 
 
 # =============================================================================
@@ -2750,10 +3191,20 @@ def eda_main(df: pd.DataFrame) -> None:
     print_section("Exploratory data analysis")
     print(f"Rows: {df.shape[0]:,} | Columns: {df.shape[1]:,}")
 
-    run_descriptive_stats(df)
+    run_dataset_overview(df)
     run_target_analysis(df)
-    run_correlation_matrix(df)
-    run_vif(df)
+    run_categorical_summary(df)
+    final_numeric_eda, final_binary_eda = run_eda_correlation_workflows(df)
+    run_numeric_summary(
+        df,
+        columns=final_numeric_eda.columns.tolist(),
+        title="Numeric summary (final reduced continuous/count EDA feature set)",
+    )
+    run_binary_summary(
+        df,
+        columns=final_binary_eda.columns.tolist(),
+        title="Binary indicator summary (final reduced EDA feature set)",
+    )
 
     print_section("EDA completed")
     print(f"Plots saved to: {PLOT_OUTPUT_DIR}")
