@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import requests
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 
 from colorspace import qualitative_hcl
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate, GridSearchCV
@@ -2785,6 +2786,18 @@ def select_eda_candidate_sets(
     return candidates[continuous_cols].copy(), candidates[binary_cols].copy(), diagnostics
 
 
+def drop_screened_eda_exclusions(
+    df: pd.DataFrame,
+    screening_drops: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return the EDA view after removing variables reported as excluded."""
+    if screening_drops.empty:
+        return df
+
+    to_drop = available_columns(df, screening_drops["variable"].dropna().unique().tolist())
+    return df.drop(columns=to_drop)
+
+
 def _interpretability_drop_score(column: str) -> int:
     """Higher score means the variable is less preferred when redundancy exists."""
     if column in EDA_INTERPRETABILITY_KEEP_PRIORITY:
@@ -2943,6 +2956,34 @@ def _format_vif_table(vif: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+def add_vif_evidence_to_drops(
+    drops: pd.DataFrame,
+    vif_reference: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach candidate-set VIF scores to variables removed before VIF reduction."""
+    if drops.empty or vif_reference.empty:
+        return drops
+
+    drops = drops.copy()
+    vif_lookup = vif_reference.set_index("variable")["VIF"]
+    missing_vif = drops["vif"].isna()
+    drops.loc[missing_vif, "vif"] = drops.loc[missing_vif, "variable"].map(vif_lookup)
+    return drops
+
+
+def format_multicollinearity_drop_table(diagnostics: pd.DataFrame) -> pd.DataFrame:
+    """Show the evidence used to exclude redundant variables from the EDA matrix."""
+    if diagnostics.empty:
+        return diagnostics
+
+    display = diagnostics[["variable", "vif", "correlated_with", "correlation"]].copy()
+    display = display.rename(columns={"vif": "VIF"})
+    display["VIF"] = display["VIF"].map(
+        lambda v: "" if pd.isna(v) else (">1000" if v > 1000 else f"{v:,.2f}")
+    )
+    return display
+
+
 def iteratively_reduce_high_vif(
     numeric: pd.DataFrame,
     threshold: float = VIF_THRESHOLD,
@@ -2990,9 +3031,10 @@ def plot_reduced_correlation_matrix(
     numeric: pd.DataFrame,
     df: pd.DataFrame,
     filename: str = "correlation_matrix.png",
-    title: str = "Reduced EDA feature-set correlation matrix (lower triangle)",
+    title: str = "Reduced EDA feature-set correlation matrix",
+    annotate_cells: bool = True,
 ) -> None:
-    """Plot the final lower-triangle correlation matrix after reduction."""
+    """Plot the final reduced correlation matrix after reduction."""
     if numeric.shape[1] < 2:
         print("Not enough reduced numeric columns for a correlation matrix plot.")
         return
@@ -3002,33 +3044,122 @@ def plot_reduced_correlation_matrix(
         plot_df = pd.concat([df[[TARGET]], plot_df], axis=1)
 
     corr = plot_df.corr(numeric_only=True)
-    corr_plot = corr.mask(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-    cmap = plt.get_cmap("coolwarm").copy()
+    lower_triangle = np.tril(np.ones(corr.shape, dtype=bool), k=-1)
+    corr_plot = corr.mask(lower_triangle)
+    cmap = plt.get_cmap("RdBu").copy()
     cmap.set_bad(color="white")
+    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
 
-    fig_size = max(10, min(18, 0.45 * len(corr.columns) + 6))
-    plt.figure(figsize=(fig_size, fig_size * 0.85))
-    plt.imshow(corr_plot, cmap=cmap, vmin=-1, vmax=1)
-    plt.colorbar(label="Pearson correlation")
-    plt.xticks(range(len(corr.columns)), corr.columns, rotation=90, fontsize=7)
-    plt.yticks(range(len(corr.columns)), corr.columns, fontsize=7)
-    for row_idx in range(corr_plot.shape[0]):
-        for col_idx in range(corr_plot.shape[1]):
-            value = corr_plot.iloc[row_idx, col_idx]
-            if pd.isna(value):
-                continue
-            text_color = "white" if abs(value) >= 0.5 else "black"
-            plt.text(
-                col_idx,
-                row_idx,
-                f"{value:.2f}",
-                ha="center",
-                va="center",
-                color=text_color,
-                fontsize=6,
-            )
-    plt.title(title)
+    fig_size = max(8, min(14, 0.38 * len(corr.columns) + 4))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    image = ax.imshow(corr_plot, cmap=cmap, norm=norm, aspect="equal")
+    fig.colorbar(image, ax=ax, label="Pearson correlation", fraction=0.046, pad=0.04)
+    ax.set_xticks(range(len(corr.columns)))
+    ax.set_yticks(range(len(corr.columns)))
+    ax.set_xticklabels(corr.columns, rotation=90, ha="center", va="bottom", fontsize=7)
+    ax.tick_params(axis="y", left=False, labelleft=False)
+    ax.xaxis.tick_top()
+    # About 4 mm of padding keeps the top labels close but prevents overlap.
+    ax.tick_params(axis="x", top=False, labeltop=True, bottom=False, labelbottom=False, pad=11)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    # Use the masked half of the matrix as label space so the row labels sit
+    # next to the diagonal instead of on the outside axis.
+    for idx, label in enumerate(corr.index):
+        ax.text(
+            idx - 0.62,
+            idx,
+            label,
+            rotation=0,
+            ha="right",
+            va="center",
+            fontsize=7,
+            color="black",
+            clip_on=False,
+        )
+    if annotate_cells:
+        for row_idx in range(corr_plot.shape[0]):
+            for col_idx in range(corr_plot.shape[1]):
+                value = corr_plot.iloc[row_idx, col_idx]
+                if pd.isna(value):
+                    continue
+                text_color = "white" if abs(value) >= 0.5 else "black"
+                ax.text(
+                    col_idx,
+                    row_idx,
+                    f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    color=text_color,
+                    fontsize=6,
+                )
+    ax.set_title(title, pad=24)
     save_current_plot(filename)
+
+
+def select_compact_target_correlated_features(
+    final_features: pd.DataFrame,
+    df: pd.DataFrame,
+    threshold: float = 0.05,
+    min_features: int = 8,
+    max_features: int = 10,
+) -> pd.DataFrame:
+    """Select reduced numeric features most associated with the target for the paper plot."""
+    if TARGET not in df.columns or not pd.api.types.is_numeric_dtype(df[TARGET]):
+        return final_features.iloc[:, :0].copy()
+
+    correlations = (
+        pd.concat([df[[TARGET]], final_features], axis=1)
+        .corr(numeric_only=True)[TARGET]
+        .drop(TARGET)
+        .dropna()
+        .rename("correlation_with_satisfied")
+        .reset_index()
+        .rename(columns={"index": "variable"})
+    )
+    if correlations.empty:
+        return final_features.iloc[:, :0].copy()
+
+    correlations["abs_correlation"] = correlations["correlation_with_satisfied"].abs()
+    correlations = correlations.sort_values(
+        ["abs_correlation", "variable"],
+        ascending=[False, True],
+    )
+
+    selected = correlations[correlations["abs_correlation"] >= threshold]
+    if len(selected) < min_features:
+        selected = correlations.head(min(min_features, len(correlations)))
+    elif len(selected) > max_features:
+        selected = selected.head(max_features)
+
+    selected = selected.copy()
+    selected["correlation_with_satisfied"] = selected["correlation_with_satisfied"].round(4)
+    selected["abs_correlation"] = selected["abs_correlation"].round(4)
+    print_table(
+        selected,
+        "Variables selected for compact main-text numerical correlation matrix",
+        max_rows=max(max_features, len(selected)),
+    )
+    return final_features[selected["variable"].tolist()].copy()
+
+
+def plot_compact_main_text_correlation_matrix(
+    final_features: pd.DataFrame,
+    df: pd.DataFrame,
+) -> None:
+    """Plot a compact target-focused numerical correlation matrix for the main paper."""
+    compact_features = select_compact_target_correlated_features(final_features, df)
+    if compact_features.shape[1] < 2:
+        print("Not enough compact numerical features for the main-text correlation matrix.")
+        return
+
+    plot_reduced_correlation_matrix(
+        compact_features,
+        df,
+        filename="correlation_matrix_main_text.png",
+        title="Compact numerical correlation matrix for variables most associated with satisfaction",
+        annotate_cells=True,
+    )
 
 
 def run_reduced_correlation_vif_workflow(
@@ -3062,10 +3193,12 @@ def run_reduced_correlation_vif_workflow(
             max_rows=max(50, len(target_corr)),
         )
 
+    vif_candidates = calculate_vif(candidates)
     reduced_corr, corr_drops, pairs_df = remove_highly_correlated_variables(
         candidates,
         threshold=CORR_THRESHOLD,
     )
+    corr_drops = add_vif_evidence_to_drops(corr_drops, vif_candidates)
     if pairs_df.empty:
         print(f"\nNo {feature_type.lower()} pairs with |correlation| >= {CORR_THRESHOLD}.")
     else:
@@ -3120,14 +3253,14 @@ def run_reduced_correlation_vif_workflow(
         columns=["variable", "reason", "correlated_with", "correlation", "vif", "step"]
     )
     if feature_type == "Continuous numeric":
-        removed = diagnostics[["variable"]].drop_duplicates().reset_index(drop=True)
+        removed = format_multicollinearity_drop_table(diagnostics)
         print_table(
             removed,
             "Continuous numeric variables removed by multicollinearity rule",
             max_rows=max(80, len(removed)),
         )
     elif feature_type == "Binary indicator":
-        removed = diagnostics[["variable"]].drop_duplicates().reset_index(drop=True)
+        removed = format_multicollinearity_drop_table(diagnostics)
         print_table(
             removed,
             "Binary indicator variables removed by multicollinearity rule",
@@ -3144,14 +3277,17 @@ def run_reduced_correlation_vif_workflow(
         final_features,
         df,
         filename=plot_filename,
-        title=f"Reduced {feature_type.lower()} EDA feature-set correlation matrix (lower triangle)",
+        title=f"Reduced {feature_type.lower()} EDA feature-set correlation matrix",
+        annotate_cells=feature_type != "Binary indicator",
     )
+    if feature_type == "Continuous numeric":
+        plot_compact_main_text_correlation_matrix(final_features, df)
     return final_features, diagnostics
 
 
 def run_eda_correlation_workflows(
     df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     print_section("EDA feature screening")
 
     continuous_candidates, binary_candidates, screening_drops = select_eda_candidate_sets(df)
@@ -3162,25 +3298,26 @@ def run_eda_correlation_workflows(
         f"binary indicator candidates: {binary_candidates.shape[1]:,}"
     )
     print_table(
-        screening_drops,
-        "Variables excluded before numeric/binary diagnostics",
+        screening_drops[["variable"]] if not screening_drops.empty else screening_drops,
+        "Variables excluded because of leakage rule",
         max_rows=max(80, len(screening_drops)),
     )
+    eda_df = drop_screened_eda_exclusions(df, screening_drops)
 
     final_continuous, _ = run_reduced_correlation_vif_workflow(
-        df=df,
+        df=eda_df,
         candidates=continuous_candidates,
         feature_type="Continuous numeric",
         plot_filename="correlation_matrix.png",
     )
     final_binary, _ = run_reduced_correlation_vif_workflow(
-        df=df,
+        df=eda_df,
         candidates=binary_candidates,
         feature_type="Binary indicator",
         plot_filename="binary_correlation_matrix.png",
     )
 
-    return final_continuous, final_binary
+    return eda_df, final_continuous, final_binary
 
 
 # =============================================================================
@@ -3193,15 +3330,15 @@ def eda_main(df: pd.DataFrame) -> None:
 
     run_dataset_overview(df)
     run_target_analysis(df)
-    run_categorical_summary(df)
-    final_numeric_eda, final_binary_eda = run_eda_correlation_workflows(df)
+    eda_feature_df, final_numeric_eda, final_binary_eda = run_eda_correlation_workflows(df)
+    run_categorical_summary(eda_feature_df)
     run_numeric_summary(
-        df,
+        eda_feature_df,
         columns=final_numeric_eda.columns.tolist(),
         title="Numeric summary (final reduced continuous/count EDA feature set)",
     )
     run_binary_summary(
-        df,
+        eda_feature_df,
         columns=final_binary_eda.columns.tolist(),
         title="Binary indicator summary (final reduced EDA feature set)",
     )
