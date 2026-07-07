@@ -64,6 +64,34 @@ from sklearn.metrics import (
 # ================================================================================
 
 # ---------------------------------------------------------------------------
+# Pipeline stage toggles  (run only the parts you need)
+# ---------------------------------------------------------------------------
+# The project is one linear pipeline:
+#     ingestion -> preprocessing -> weather merge -> EDA -> modelling -> results
+# Each stage is gated below so parts can be run in isolation. The stages hand
+# off through the cached enriched dataset (DATASET_PKL), so EDA or modelling can
+# run straight from the cache without repeating the expensive ingestion stage.
+#
+#   RUN_INGESTION  Stage 1-2b: parse raw CSVs, clean, merge, and enrich with
+#                  NOAA weather, rebuilding the cached enriched dataset from raw.
+#                  Turn OFF to skip ingestion and load the cached dataset.
+#   RUN_EDA        Stage 3: exploratory data analysis on the raw, untransformed
+#                  enriched dataset (before any log transform).
+#   RUN_MODELING   Stages 4-6: EDA-informed feature transition, model training
+#                  and comparison, and exported results.
+#
+# Typical use while writing the paper:
+#   - writing EDA:       RUN_INGESTION = False, RUN_EDA = True,  RUN_MODELING = False
+#   - writing modelling: RUN_INGESTION = False, RUN_EDA = False, RUN_MODELING = True
+#   - full end-to-end:   RUN_INGESTION = True,  RUN_EDA = True,  RUN_MODELING = True
+#
+# Note: ingestion rebuilds the dataset from the raw CSVs, but the NOAA weather
+# download stays cached (WEATHER_CACHE_PKL), so it is not re-downloaded.
+RUN_INGESTION = False
+RUN_EDA = True
+RUN_MODELING = False
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 DATA_DIR = Path(r"C:\Users\fynne\University\Data Science and Marketing Analytics\data")
@@ -135,18 +163,6 @@ WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 
 # Global random seed (single source of truth).
 RANDOM_STATE = 42
-
-# Script-level run lever.
-# - "full_pipeline" preserves the normal end-to-end workflow.
-# - "inspect_yelp_features" builds/loads the fuller Yelp-only review-level
-#   dataset and writes a feature inventory.
-# - "eda_full_yelp_inspection" loads that cached full Yelp dataset and runs EDA
-#   without reparsing/cleaning/merging the raw files each time.
-RUN_MODE = "eda_full_yelp_inspection"
-
-REBUILD_FULL_YELP_INSPECTION_DATASET = False
-YELP_FEATURE_INVENTORY_CSV = PROCESSED_DATA_DIR / "yelp_full_feature_inventory.csv"
-YELP_FULL_INSPECTION_PKL = PROCESSED_DATA_DIR / "yelp_full_merged_inspection.pkl"
 
 
 # ================================================================================
@@ -948,7 +964,6 @@ def plot_yearly_review_count_and_missingness(
         loc="upper left",
     )
 
-    plt.title("Yearly review count and missingness before study-scope filtering")
     fig.tight_layout()
 
     output_path = output_dir / "yearly_review_count_and_missingness.png"
@@ -1048,10 +1063,6 @@ def plot_top_city_review_count_and_missingness(
             color="0.25",
         )
 
-    plt.title(
-        f"Top {len(city_coverage)} city-state markets by review count "
-        f"({min_year} onward, before city-scope filtering)"
-    )
     fig.tight_layout()
 
     output_path = output_dir / "top_city_review_count_and_missingness.png"
@@ -1139,7 +1150,6 @@ def plot_philadelphia_city_variants_before_standardization(
     plt.barh(counts.index.astype(str), counts.values, color=colors)
     plt.xlabel("Number of records")
     plt.ylabel("Raw city value")
-    plt.title("Most frequent non-standard raw city-name variants mapped to Philadelphia")
     plt.tight_layout()
 
     output_path = output_dir / "philadelphia_city_variants_before_standardization.png"
@@ -1665,351 +1675,6 @@ def process_data(tables: dict) -> pd.DataFrame:
     return model_data
 
 
-def _rename_remaining_overlaps(
-    left: pd.DataFrame,
-    right: pd.DataFrame,
-    merge_keys: list[str],
-    prefix: str,
-) -> pd.DataFrame:
-    """Rename non-key columns that would otherwise become *_x / *_y.
-
-    The known Yelp overlaps are handled by prepare_core_tables() using readable
-    project names such as review_stars and business_stars. This helper catches
-    any extra raw columns that overlap, preserving them for inspection without
-    creating ambiguous merge suffixes.
-    """
-    protected = set(merge_keys)
-    overlaps = (set(left.columns) & set(right.columns)) - protected
-    rename_map = {
-        col: f"{prefix}_{col}"
-        for col in overlaps
-        if not col.startswith(f"{prefix}_")
-    }
-    return right.rename(columns=rename_map)
-
-
-def create_tip_inspection_features(tip: pd.DataFrame) -> pd.DataFrame:
-    """Create one-row-per-business tip features for the inspection dataset."""
-    if tip.empty or "business_id" not in tip.columns:
-        return pd.DataFrame(columns=["business_id"])
-
-    tip = tip.copy()
-    if "text" in tip.columns:
-        tip["tip_text_length"] = tip["text"].fillna("").astype(str).str.len()
-
-    aggregations = {}
-    if "text" in tip.columns:
-        aggregations["tip_count"] = ("text", "count")
-    else:
-        aggregations["tip_count"] = ("business_id", "size")
-    if "compliment_count" in tip.columns:
-        aggregations["tip_compliment_count"] = ("compliment_count", "sum")
-    if "tip_text_length" in tip.columns:
-        aggregations["tip_text_length_mean"] = ("tip_text_length", "mean")
-        aggregations["tip_text_length_median"] = ("tip_text_length", "median")
-        aggregations["tip_text_length_max"] = ("tip_text_length", "max")
-    if "user_id" in tip.columns:
-        aggregations["tip_user_count"] = ("user_id", "nunique")
-    if "date" in tip.columns:
-        aggregations["tip_first_date"] = ("date", "min")
-        aggregations["tip_last_date"] = ("date", "max")
-
-    return tip.groupby("business_id").agg(**aggregations).reset_index()
-
-
-def create_photo_inspection_features(photo: pd.DataFrame) -> pd.DataFrame:
-    """Create one-row-per-business photo features, including label counts."""
-    if photo.empty or "business_id" not in photo.columns:
-        return pd.DataFrame(columns=["business_id"])
-
-    photo = photo.copy()
-    photo_id_col = "photo_id" if "photo_id" in photo.columns else "business_id"
-    photo_features = photo.groupby("business_id").agg(
-        photo_count=(photo_id_col, "count")
-    ).reset_index()
-
-    if "label" in photo.columns:
-        photo_label_features = (
-            photo.pivot_table(
-                index="business_id",
-                columns="label",
-                values=photo_id_col,
-                aggfunc="count",
-                fill_value=0,
-            )
-            .add_prefix("photo_")
-            .reset_index()
-        )
-        photo_features = photo_features.merge(
-            photo_label_features,
-            on="business_id",
-            how="left",
-        )
-
-    if "caption" in photo.columns:
-        photo["photo_caption_length"] = photo["caption"].fillna("").astype(str).str.len()
-        caption_features = photo.groupby("business_id").agg(
-            photo_caption_count=("caption", "count"),
-            photo_caption_length_mean=("photo_caption_length", "mean"),
-            photo_caption_length_max=("photo_caption_length", "max"),
-        ).reset_index()
-        photo_features = photo_features.merge(
-            caption_features,
-            on="business_id",
-            how="left",
-        )
-
-    return photo_features
-
-
-def build_full_yelp_inspection_dataset(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Build a full Yelp-only review-level dataset for feature discovery.
-
-    Unlike process_data(), this path does not select a narrow modelling feature
-    set before merging. It keeps the business/review/user tables broadly intact
-    and only aggregates one-to-many tables first so each output row remains one
-    review.
-    """
-    business = tables["business"]
-    reviews = tables["reviews"]
-    users = tables["users"]
-    checkin = tables["checkin"]
-    tip = tables["tip"]
-    photo = tables["photo"]
-
-    business, reviews, users = prepare_core_tables(
-        business=business,
-        reviews=reviews,
-        users=users,
-    )
-    if "review_text" in reviews.columns and "review_text_length" not in reviews.columns:
-        reviews = reviews.copy()
-        reviews["review_text_length"] = reviews["review_text"].fillna("").str.len()
-
-    business = add_business_subfeatures(business)
-
-    business = _rename_remaining_overlaps(
-        left=reviews,
-        right=business,
-        merge_keys=["business_id"],
-        prefix="business",
-    )
-    users = _rename_remaining_overlaps(
-        left=reviews,
-        right=users,
-        merge_keys=["user_id"],
-        prefix="user",
-    )
-
-    checkin_features = create_checkin_features(checkin)
-    tip_features = create_tip_inspection_features(tip)
-    photo_features = create_photo_inspection_features(photo)
-
-    print("\nBuilding full Yelp inspection dataset...")
-    rows_before = len(reviews)
-    dataset = reviews.merge(business, on="business_id", how="left")
-    dataset = dataset.merge(users, on="user_id", how="left")
-    dataset = dataset.merge(checkin_features, on="business_id", how="left")
-    dataset = dataset.merge(tip_features, on="business_id", how="left")
-    dataset = dataset.merge(photo_features, on="business_id", how="left")
-
-    if len(dataset) != rows_before:
-        raise ValueError(
-            "Inspection merge changed the number of review rows. "
-            f"Expected {rows_before:,}, got {len(dataset):,}."
-        )
-
-    dataset = clean_values(dataset)
-    plot_yearly_review_count_and_missingness(
-        dataset=dataset,
-        output_dir=PLOT_OUTPUT_DIR,
-        min_year_marker=MIN_REVIEW_YEAR,
-    )
-    plot_philadelphia_city_variants_before_standardization(
-        dataset=dataset,
-        output_dir=PLOT_OUTPUT_DIR,
-        top_n=12,
-    )
-    plot_top_city_review_count_and_missingness(
-        dataset=standardize_city_names(dataset),
-        output_dir=PLOT_OUTPUT_DIR,
-        top_n=15,
-        min_year=MIN_REVIEW_YEAR,
-    )
-    print(f"Full Yelp inspection dataset: {dataset.shape[0]:,} rows x "
-          f"{dataset.shape[1]:,} columns")
-    return dataset
-
-
-def is_nested_or_flattened_json_column(column: str) -> bool:
-    """Flag columns that look like JSON-normalized or nested Yelp fields."""
-    lower = column.lower()
-    return (
-        "." in column
-        or lower.startswith("attributes.")
-        or lower.startswith("hours.")
-        or lower.startswith("ambience.")
-        or "ambience" in lower
-        or "categories" in lower
-        or "businessparking" in lower
-        or "goodfor" in lower
-    )
-
-
-def classify_feature_family(column: str) -> str:
-    """Assign a human-readable feature family for the inspection inventory."""
-    lower = column.lower()
-
-    if column in ID_COLS or lower.endswith("_id"):
-        return "ID columns"
-    if lower.startswith("attributes.") or "ambience" in lower:
-        return "business attribute columns"
-    if lower.startswith("hours."):
-        return "hours columns"
-    if "categories" in lower:
-        return "category columns"
-    if lower.startswith("checkin"):
-        return "check-in columns"
-    if lower.startswith("tip"):
-        return "tip columns"
-    if lower.startswith("photo"):
-        return "photo columns"
-    if lower.startswith("review_") or column == TARGET:
-        return "review columns"
-    if lower.startswith("user_"):
-        return "user columns"
-    if (
-        lower.startswith("business_")
-        or column in {"is_open", "city", "state", "latitude", "longitude",
-                      "postal_code", "address"}
-    ):
-        return "business columns"
-    return "other columns"
-
-
-def _safe_nunique(series: pd.Series):
-    """Return nunique where practical; skip very large free-text columns."""
-    lower = series.name.lower()
-    if "text" in lower:
-        return np.nan
-    try:
-        return int(series.nunique(dropna=True))
-    except TypeError:
-        return np.nan
-
-
-def create_feature_inventory(df: pd.DataFrame) -> pd.DataFrame:
-    """Create a column-level feature inventory for the inspection dataset."""
-    rows = []
-    n_rows = len(df)
-    for column in df.columns:
-        missing_count = int(df[column].isna().sum())
-        rows.append({
-            "column": column,
-            "dtype": str(df[column].dtype),
-            "missing_count": missing_count,
-            "missing_percent": (missing_count / n_rows * 100) if n_rows else np.nan,
-            "n_unique": _safe_nunique(df[column]),
-            "feature_family": classify_feature_family(column),
-            "is_nested_or_flattened_json": is_nested_or_flattened_json_column(column),
-        })
-
-    return pd.DataFrame(rows).sort_values(
-        ["feature_family", "column"],
-        kind="stable",
-    ).reset_index(drop=True)
-
-
-def load_or_build_full_yelp_inspection_dataset(rebuild: bool = False) -> pd.DataFrame:
-    """Load the cached full merged Yelp dataset, or build and cache it once."""
-    if YELP_FULL_INSPECTION_PKL.exists() and not rebuild:
-        print(f"Loading full Yelp inspection dataset: {YELP_FULL_INSPECTION_PKL}")
-        return pd.read_pickle(YELP_FULL_INSPECTION_PKL)
-
-    tables = load_raw_data()
-    dataset = build_full_yelp_inspection_dataset(tables)
-    dataset.to_pickle(YELP_FULL_INSPECTION_PKL)
-    print(f"Saved full Yelp inspection dataset: {YELP_FULL_INSPECTION_PKL}")
-    return dataset
-
-
-def inspect_yelp_features_main() -> None:
-    """Run only the Yelp ingestion and full feature-inspection workflow."""
-    print_section("Yelp feature inspection mode")
-    dataset = load_or_build_full_yelp_inspection_dataset(
-        rebuild=REBUILD_FULL_YELP_INSPECTION_DATASET
-    )
-    inventory = create_feature_inventory(dataset)
-
-    print(f"\nDataset shape: {dataset.shape[0]:,} rows x "
-          f"{dataset.shape[1]:,} columns")
-    print(f"Feature inventory created for {len(inventory):,} columns.")
-
-    inventory.to_csv(YELP_FEATURE_INVENTORY_CSV, index=False)
-
-
-def prepare_cached_full_yelp_for_eda(dataset: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply the research EDA scope to the cached full Yelp inspection dataset.
-
-    The cache keeps the broad 180-column merged data so raw import/clean/merge
-    does not repeat. This step then makes the actual research EDA dataset from
-    that cache and prints the dropped-variable audit table.
-    """
-    print_section("Preparing cached full Yelp dataset for EDA")
-
-    clean_before = list(dataset.columns)
-    dataset = standardize_city_names(dataset)
-    report_feature_change(
-        "standardize_city_names [cached full Yelp EDA]",
-        clean_before,
-        dataset.columns,
-    )
-
-    plot_top_city_review_count_and_missingness(
-        dataset=dataset,
-        output_dir=PLOT_OUTPUT_DIR,
-        top_n=15,
-        min_year=MIN_REVIEW_YEAR,
-    )
-
-    print("\nFiltering study scope...")
-    rows_before = len(dataset)
-    dataset = filter_study_scope(dataset)
-    print(f"\n[filter_study_scope] dropped ROWS, not columns: "
-          f"{rows_before:,} -> {len(dataset):,}")
-
-    print("\nSelecting final EDA columns...")
-    select_before = dataset
-    eda_dataset = select_model_columns(dataset)
-    report_feature_change(
-        "select_model_columns [cached full Yelp EDA]",
-        select_before.columns,
-        eda_dataset.columns,
-    )
-    report_dropped_variable_table(
-        "select_model_columns [cached full Yelp EDA]",
-        before_df=select_before,
-        after_columns=eda_dataset.columns,
-    )
-
-    print("\nOptimizing dtypes...")
-    return optimize_dtypes(eda_dataset)
-
-
-def eda_full_yelp_inspection_main() -> None:
-    """Run EDA from the cached full merged Yelp inspection dataset."""
-    print_section("EDA on full Yelp inspection dataset")
-    dataset = load_or_build_full_yelp_inspection_dataset(
-        rebuild=REBUILD_FULL_YELP_INSPECTION_DATASET
-    )
-    eda_dataset = prepare_cached_full_yelp_for_eda(dataset)
-    eda_main(eda_dataset)
-
-    print("\nDone.")
-    print(f"EDA dataset: {eda_dataset.shape[0]:,} rows x {eda_dataset.shape[1]} columns")
-
-
 # ================================================================================
 # 2b. WEATHER ENRICHMENT  (download + merge NOAA daily weather)
 # ================================================================================
@@ -2423,15 +2088,19 @@ def plot_bar(
     ylabel: str,
     filename: str,
     rotate_labels: bool = True,
+    hline: float | None = None,
 ) -> None:
     if table.empty:
         return
 
     plt.figure(figsize=(11, 6))
     plt.bar(table[x_col].astype(str), table[y_col])
-    plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
+    # Optional reference line (e.g. the overall satisfaction rate) so the reader
+    # can see which groups sit above or below the baseline at a glance.
+    if hline is not None:
+        plt.axhline(hline, color="0.35", linestyle="--", linewidth=1.2)
     if rotate_labels:
         plt.xticks(rotation=45, ha="right")
     save_current_plot(filename)
@@ -2666,6 +2335,265 @@ def run_target_analysis(df: pd.DataFrame) -> None:
             ylabel="Number of reviews",
             filename="review_stars_distribution.png",
             rotate_labels=False,
+        )
+
+
+# =============================================================================
+# Satisfaction by group (business-facing descriptive analysis)
+# =============================================================================
+
+# Calendar helpers for the timing breakdowns.
+WEEKDAY_NAMES = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MONTH_TO_SEASON = {
+    12: "Winter", 1: "Winter", 2: "Winter",
+    3: "Spring", 4: "Spring", 5: "Spring",
+    6: "Summer", 7: "Summer", 8: "Summer",
+    9: "Autumn", 10: "Autumn", 11: "Autumn",
+}
+SEASON_ORDER = ["Winter", "Spring", "Summer", "Autumn"]
+
+# Continuous variables compared between satisfied and dissatisfied reviews. These
+# are shown descriptively (means by class); leakage columns are deliberately not
+# listed here. Weather is included so the paper can answer directly whether
+# weather differs between satisfied and dissatisfied reviews.
+SATISFACTION_COMPARE_COLS = [
+    # Weather (continuous)
+    "weather_tmax", "weather_tmin", "weather_temp_range",
+    "weather_prcp", "weather_snow", "weather_snow_depth",
+    # Engagement / business activity
+    "business_review_count", "checkin_count", "tip_count",
+    "tip_compliment_count", "photo_count",
+    # User history
+    "user_review_count", "user_fans", "user_useful",
+    # Structured review characteristics
+    "review_text_length", "review_year",
+]
+
+
+def satisfaction_rate_by(
+    df: pd.DataFrame,
+    group,
+    group_name: str,
+    min_count: int = 200,
+    sort_by: str = "rate",
+) -> pd.DataFrame:
+    """Satisfaction rate per level of a grouping variable.
+
+    Returns the level, its review_count, satisfaction_rate_percent, and the
+    deviation in percentage points from the overall rate. Groups with fewer than
+    ``min_count`` reviews are dropped so small, noisy cells do not distort the
+    comparison. ``sort_by`` is "rate" (descending satisfaction) or "group".
+    """
+    overall = df[TARGET].mean() * 100
+    work = pd.DataFrame({group_name: np.asarray(group), TARGET: df[TARGET].to_numpy()})
+    grouped = work.groupby(group_name, observed=True)[TARGET]
+    tbl = grouped.agg(review_count="size", rate="mean").reset_index()
+    tbl["satisfaction_rate_percent"] = (tbl["rate"] * 100).round(2)
+    tbl["vs_overall_pp"] = (tbl["satisfaction_rate_percent"] - overall).round(2)
+    tbl = tbl.drop(columns="rate")
+    tbl = tbl[tbl["review_count"] >= min_count]
+    if sort_by == "rate":
+        tbl = tbl.sort_values("satisfaction_rate_percent", ascending=False)
+    else:
+        tbl = tbl.sort_values(group_name)
+    return tbl.reset_index(drop=True)
+
+
+def run_satisfaction_by_group(df: pd.DataFrame) -> None:
+    """Satisfaction rate broken down by location, timing, user experience, and
+    weather conditions -- the descriptive core that supports the managerial
+    interpretation in the paper."""
+    print_section("Satisfaction rate by group")
+    overall = df[TARGET].mean() * 100
+    print(f"\nOverall satisfaction rate: {overall:.2f}%")
+
+    if "city" in df.columns:
+        by_city = satisfaction_rate_by(df, df["city"], "city", min_count=500)
+        print_table(by_city, "Satisfaction rate by city")
+        plot_bar(
+            by_city, "city", "satisfaction_rate_percent",
+            title="", xlabel="City", ylabel="Satisfaction rate (%)",
+            filename="satisfaction_by_city.png", hline=overall,
+        )
+
+    if "review_month" in df.columns:
+        season = pd.to_numeric(df["review_month"], errors="coerce").map(MONTH_TO_SEASON)
+        by_season = satisfaction_rate_by(df, season, "season", sort_by="group")
+        by_season["season"] = pd.Categorical(
+            by_season["season"], categories=SEASON_ORDER, ordered=True
+        )
+        by_season = by_season.sort_values("season").reset_index(drop=True)
+        print_table(by_season, "Satisfaction rate by season")
+        plot_bar(
+            by_season, "season", "satisfaction_rate_percent",
+            title="", xlabel="Season", ylabel="Satisfaction rate (%)",
+            filename="satisfaction_by_season.png", rotate_labels=False, hline=overall,
+        )
+
+    if "review_weekday" in df.columns:
+        weekday = pd.to_numeric(df["review_weekday"], errors="coerce").map(WEEKDAY_NAMES)
+        by_weekday = satisfaction_rate_by(df, weekday, "weekday", sort_by="group")
+        by_weekday["weekday"] = pd.Categorical(
+            by_weekday["weekday"], categories=WEEKDAY_ORDER, ordered=True
+        )
+        by_weekday = by_weekday.sort_values("weekday").reset_index(drop=True)
+        print_table(by_weekday, "Satisfaction rate by day of week")
+        plot_bar(
+            by_weekday, "weekday", "satisfaction_rate_percent",
+            title="", xlabel="Day of week", ylabel="Satisfaction rate (%)",
+            filename="satisfaction_by_weekday.png", rotate_labels=False, hline=overall,
+        )
+
+    if "review_year" in df.columns:
+        year_values = pd.to_numeric(df["review_year"], errors="coerce")
+        by_year = satisfaction_rate_by(df, year_values, "review_year", sort_by="group")
+        print_table(by_year, "Satisfaction rate by review year")
+        plot_bar(
+            by_year, "review_year", "satisfaction_rate_percent",
+            title="", xlabel="Review year", ylabel="Satisfaction rate (%)",
+            filename="satisfaction_by_year.png", hline=overall,
+        )
+
+    if "user_review_count" in df.columns:
+        uec = pd.to_numeric(df["user_review_count"], errors="coerce")
+        bucket = pd.cut(
+            uec,
+            bins=[0, 1, 5, 20, 100, np.inf],
+            labels=["1", "2-5", "6-20", "21-100", "100+"],
+            include_lowest=True,
+        )
+        bucket = bucket.cat.add_categories("Unknown").fillna("Unknown")
+        by_user = satisfaction_rate_by(df, bucket, "user_experience", sort_by="group")
+        user_order = ["1", "2-5", "6-20", "21-100", "100+", "Unknown"]
+        by_user["user_experience"] = pd.Categorical(
+            by_user["user_experience"], categories=user_order, ordered=True
+        )
+        by_user = by_user.sort_values("user_experience").reset_index(drop=True)
+        print_table(
+            by_user,
+            "Satisfaction rate by user experience (total user review count)",
+        )
+        plot_bar(
+            by_user, "user_experience", "satisfaction_rate_percent",
+            title="", xlabel="User review-count bucket", ylabel="Satisfaction rate (%)",
+            filename="satisfaction_by_user_experience.png", rotate_labels=False, hline=overall,
+        )
+
+    weather_flags = [c for c in ["is_rainy", "is_snowy", "is_hot", "is_cold"] if c in df.columns]
+    if weather_flags:
+        rows = []
+        for col in weather_flags:
+            flag = pd.to_numeric(df[col], errors="coerce")
+            present, absent = flag == 1, flag == 0
+            rate_present = df.loc[present, TARGET].mean() * 100 if present.any() else np.nan
+            rate_absent = df.loc[absent, TARGET].mean() * 100 if absent.any() else np.nan
+            rows.append({
+                "condition": col.replace("is_", ""),
+                "days_present_count": int(present.sum()),
+                "sat_rate_present_percent": round(rate_present, 2),
+                "sat_rate_absent_percent": round(rate_absent, 2),
+                "difference_pp": round(rate_present - rate_absent, 2),
+            })
+        cond = pd.DataFrame(rows).sort_values("difference_pp").reset_index(drop=True)
+        print_table(cond, "Satisfaction rate by weather condition (present vs absent)")
+        plot_bar(
+            cond, "condition", "sat_rate_present_percent",
+            title="", xlabel="Weather condition present", ylabel="Satisfaction rate (%)",
+            filename="satisfaction_by_weather_condition.png", rotate_labels=False, hline=overall,
+        )
+
+
+def run_satisfaction_by_category(df: pd.DataFrame, top_n: int = 15) -> None:
+    """Satisfaction rate per restaurant category / cuisine, for the most common
+    category tags. A review can carry several category dummies, so each rate is
+    computed over the reviews tagged with that category."""
+    print_section("Satisfaction rate by restaurant category / cuisine")
+
+    category_cols = [c for c in df.columns if c.startswith("category_")]
+    if not category_cols:
+        print("No category_* dummy columns available.")
+        return
+
+    overall = df[TARGET].mean() * 100
+    rows = []
+    for col in category_cols:
+        flag = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        mask = flag == 1
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        rate = df.loc[mask, TARGET].mean() * 100
+        rows.append({
+            "category": col[len("category_"):],
+            "review_count": n,
+            "satisfaction_rate_percent": round(rate, 2),
+            "vs_overall_pp": round(rate - overall, 2),
+        })
+
+    if not rows:
+        print("No tagged category reviews found.")
+        return
+
+    tbl = pd.DataFrame(rows)
+    top = tbl.sort_values("review_count", ascending=False).head(top_n)
+    top = top.sort_values("satisfaction_rate_percent", ascending=False).reset_index(drop=True)
+    print_table(
+        top,
+        f"Satisfaction rate for the {len(top)} most common categories "
+        f"(overall {overall:.2f}%)",
+        max_rows=max(top_n, len(top)),
+    )
+
+    plot_df = top.sort_values("satisfaction_rate_percent")
+    colors = qualitative_hcl("Pastel1").colors(len(plot_df))
+    plt.figure(figsize=(11, 7))
+    plt.barh(plot_df["category"].astype(str), plot_df["satisfaction_rate_percent"], color=colors)
+    plt.axvline(overall, color="0.35", linestyle="--", linewidth=1.2)
+    plt.xlabel("Satisfaction rate (%)")
+    plt.ylabel("Restaurant category")
+    save_current_plot("satisfaction_by_category.png")
+
+
+def run_satisfied_vs_dissatisfied_comparison(df: pd.DataFrame) -> None:
+    """Compare satisfied and dissatisfied reviews on continuous variables and on
+    weather-condition prevalence -- answers 'how do the two groups differ?'."""
+    print_section("Satisfied vs dissatisfied comparison")
+
+    if TARGET not in df.columns or df[TARGET].nunique() < 2:
+        print("Both satisfaction classes are required for the comparison.")
+        return
+
+    cols = [c for c in SATISFACTION_COMPARE_COLS if c in df.columns]
+    if cols:
+        numeric = df[cols].apply(pd.to_numeric, errors="coerce")
+        grouped = numeric.groupby(df[TARGET].to_numpy()).mean()
+        out = pd.DataFrame({"variable": cols})
+        out["mean_dissatisfied"] = [grouped.loc[0, c] if 0 in grouped.index else np.nan for c in cols]
+        out["mean_satisfied"] = [grouped.loc[1, c] if 1 in grouped.index else np.nan for c in cols]
+        out["difference"] = out["mean_satisfied"] - out["mean_dissatisfied"]
+        print_table(
+            out.round(3),
+            "Mean of continuous variables by satisfaction class (satisfied minus dissatisfied)",
+            max_rows=max(40, len(out)),
+        )
+
+    weather_flags = [c for c in ["is_rainy", "is_snowy", "is_hot", "is_cold"] if c in df.columns]
+    if weather_flags:
+        shares = df.groupby(df[TARGET].to_numpy())[weather_flags].mean().mul(100)
+        rows = []
+        for col in weather_flags:
+            share_dissat = shares.loc[0, col] if 0 in shares.index else np.nan
+            share_sat = shares.loc[1, col] if 1 in shares.index else np.nan
+            rows.append({
+                "weather_condition": col.replace("is_", ""),
+                "share_dissatisfied_percent": round(share_dissat, 2),
+                "share_satisfied_percent": round(share_sat, 2),
+                "difference_pp": round(share_sat - share_dissat, 2),
+            })
+        print_table(
+            pd.DataFrame(rows),
+            "Weather-condition prevalence (%) by satisfaction class",
         )
 
 
@@ -3093,7 +3021,6 @@ def plot_reduced_correlation_matrix(
                     color=text_color,
                     fontsize=6,
                 )
-    ax.set_title(title, pad=24)
     save_current_plot(filename)
 
 
@@ -3302,19 +3229,55 @@ def run_eda_correlation_workflows(
         "Variables excluded because of leakage rule",
         max_rows=max(80, len(screening_drops)),
     )
+    # Clean remove: physically drop the leakage / ID / date / post-review
+    # variables now, so every later EDA step works on the surviving frame only.
     eda_df = drop_screened_eda_exclusions(df, screening_drops)
 
-    final_continuous, _ = run_reduced_correlation_vif_workflow(
+    final_continuous, continuous_drops = run_reduced_correlation_vif_workflow(
         df=eda_df,
         candidates=continuous_candidates,
         feature_type="Continuous numeric",
         plot_filename="correlation_matrix.png",
     )
-    final_binary, _ = run_reduced_correlation_vif_workflow(
+    final_binary, binary_drops = run_reduced_correlation_vif_workflow(
         df=eda_df,
         candidates=binary_candidates,
         feature_type="Binary indicator",
         plot_filename="binary_correlation_matrix.png",
+    )
+
+    # Clean remove (continued): physically drop the multicollinearity / VIF
+    # casualties from the working frame too. After this, the surviving eda_df IS
+    # exactly the reduced EDA feature set that the summaries below describe --
+    # nothing is flagged as excluded yet left lingering in the data.
+    kept_numeric = set(final_continuous.columns) | set(final_binary.columns)
+    candidate_numeric = set(continuous_candidates.columns) | set(binary_candidates.columns)
+    multicollinearity_dropped = sorted(candidate_numeric - kept_numeric)
+    eda_df = eda_df.drop(
+        columns=[c for c in multicollinearity_dropped if c in eda_df.columns]
+    )
+
+    # One consolidated audit of every variable removed from the EDA feature set,
+    # across all three rules (leakage screening, pairwise correlation, VIF), so
+    # the paper has a single place documenting exactly what was dropped and why.
+    consolidated = pd.concat(
+        [screening_drops, continuous_drops, binary_drops],
+        ignore_index=True,
+    ).reindex(columns=["variable", "step", "reason", "correlated_with", "correlation", "vif"])
+    consolidated = (
+        consolidated.dropna(subset=["variable"])
+        .drop_duplicates(subset=["variable"])
+        .reset_index(drop=True)
+    )
+    print_table(
+        consolidated,
+        "Complete EDA exclusion audit (all variables removed from the feature set)",
+        max_rows=max(120, len(consolidated)),
+    )
+    print(
+        f"\nFinal EDA feature set after clean removal: {eda_df.shape[1]:,} columns "
+        f"({len(final_continuous.columns):,} continuous, "
+        f"{len(final_binary.columns):,} binary, plus categoricals and the target)."
     )
 
     return eda_df, final_continuous, final_binary
@@ -3330,6 +3293,9 @@ def eda_main(df: pd.DataFrame) -> None:
 
     run_dataset_overview(df)
     run_target_analysis(df)
+    run_satisfaction_by_group(df)
+    run_satisfaction_by_category(df)
+    run_satisfied_vs_dissatisfied_comparison(df)
     eda_feature_df, final_numeric_eda, final_binary_eda = run_eda_correlation_workflows(df)
     run_categorical_summary(eda_feature_df)
     run_numeric_summary(
@@ -3337,6 +3303,10 @@ def eda_main(df: pd.DataFrame) -> None:
         columns=final_numeric_eda.columns.tolist(),
         title="Numeric summary (final reduced continuous/count EDA feature set)",
     )
+    # Skewness evidence lives here in the EDA (raw vs log1p) to justify the log
+    # transform applied later at the modelling stage. It runs on the surviving
+    # reduced feature set only, so it covers exactly the counts that get logged.
+    run_skewness_comparison(eda_feature_df)
     run_binary_summary(
         eda_feature_df,
         columns=final_binary_eda.columns.tolist(),
@@ -3449,19 +3419,20 @@ def build_model_dataset(df: pd.DataFrame) -> pd.DataFrame:
     EDA-informed transition from the EDA dataset to the modelling dataset:
       1. drop pure identifiers (IDs + station) now that all merges are done,
       2. drop the redundant features (justified by the correlation/VIF tables),
-      3. show the skewness comparison for the features we keep, then
-      4. log-and-replace those skewed counts.
+      3. log-and-replace the skewed count variables.
+
+    The raw-vs-log skewness comparison that justifies step 3 is produced earlier,
+    in the EDA (run_skewness_comparison, on the surviving features), so it is not
+    repeated here.
 
     (Low-signal features such as weather_available are removed earlier, before
     EDA, so they don't appear in the EDA tables.)
 
-    Dropping first means we never transform a feature we won't use, and the
-    skewness comparison only covers the features that survive into the model.
+    Dropping first means we never transform a feature we won't use.
     """
     print_section("Building modelling dataset (post-EDA feature decisions)")
     df = drop_identifier_columns(df)
     df = drop_redundant_features(df)
-    run_skewness_comparison(df)
     df = log_and_replace_skewed(df)
     return df
 
@@ -3956,7 +3927,6 @@ def plot_confusion(model, X_test, y_test, name: str) -> None:
     cm = confusion_matrix(y_test, model.predict(X_test))
     disp = ConfusionMatrixDisplay(cm, display_labels=["not satisfied", "satisfied"])
     disp.plot(cmap="Blues", values_format=",")
-    plt.title(f"Confusion matrix: {name}")
     plt.tight_layout()
     path = PLOT_DIR / f"confusion_matrix_{name}.png"
     plt.savefig(path, dpi=200, bbox_inches="tight")
@@ -4043,7 +4013,6 @@ def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
     plt.yticks(y, top)
     plt.gca().invert_yaxis()                      # most important feature on top
     plt.xlabel("Permutation importance (drop in ROC-AUC)")
-    plt.title("Top 10 features: permutation importance (top 3 models)")
     plt.legend(title="model")
     plt.tight_layout()
     path = PLOT_DIR / "feature_importance_by_model.png"
@@ -4122,61 +4091,59 @@ def models_main(df: pd.DataFrame) -> None:
 # ================================================================================
 
 def main() -> None:
-    """Run the project end to end.
+    """Run the project as one linear pipeline, gated by the stage toggles.
 
-    The expensive stages (import raw -> process -> weather) run only once: they
-    save the final dataset to DATASET_PKL. On every later run that file is loaded
-    directly and we go straight to EDA + modelling, so the raw data is not
-    re-parsed each time. To force a rebuild, delete DATASET_PKL or set
-    REBUILD = True.
+        ingestion -> preprocessing -> weather merge -> EDA -> modelling -> results
+
+    The three toggles at the top of the file (RUN_INGESTION, RUN_EDA,
+    RUN_MODELING) decide which stages run. All stages hand off through the cached
+    enriched dataset (DATASET_PKL):
+
+      - RUN_INGESTION on : parse raw CSVs, clean, merge, enrich with NOAA weather
+                           and rebuild DATASET_PKL from scratch.
+      - RUN_INGESTION off: skip ingestion and load DATASET_PKL from the cache, so
+                           EDA and/or modelling can run without re-parsing raw data.
+
+    This means you can, for example, iterate on the EDA write-up (RUN_EDA on,
+    the other two off) or the modelling section (RUN_MODELING on, the other two
+    off) without repeating the expensive ingestion stage each time.
     """
-    REBUILD = False
-    RUN_MODELS = True   # set True to also run the log transform + modelling
-
-    valid_run_modes = {
-        "full_pipeline",
-        "inspect_yelp_features",
-        "eda_full_yelp_inspection",
-    }
-    if RUN_MODE not in valid_run_modes:
-        raise ValueError(
-            f"Unknown RUN_MODE={RUN_MODE!r}. "
-            f"Choose one of {sorted(valid_run_modes)}."
-        )
-
-    if RUN_MODE == "inspect_yelp_features":
-        inspect_yelp_features_main()
-        return
-
-    if RUN_MODE == "eda_full_yelp_inspection":
-        eda_full_yelp_inspection_main()
-        return
-
-    if DATASET_PKL.exists() and not REBUILD:
-        print(f"Loading existing dataset: {DATASET_PKL}")
-        enriched = pd.read_pickle(DATASET_PKL)
-    else:
+    # -- Stages 1-2b: ingestion, preprocessing, NOAA weather enrichment -------
+    if RUN_INGESTION:
         tables = load_raw_data()                      # 1. import raw data
         processed = process_data(tables)              # 2. clean / merge / sample
         enriched = build_weather_enriched(processed)  # 2b. + NOAA weather (saved)
+    else:
+        if not DATASET_PKL.exists():
+            raise FileNotFoundError(
+                f"RUN_INGESTION is off but no cached dataset was found at:\n"
+                f"  {DATASET_PKL}\n"
+                "Set RUN_INGESTION = True to build it once from the raw data."
+            )
+        print(f"Loading cached enriched dataset: {DATASET_PKL}")
+        enriched = pd.read_pickle(DATASET_PKL)
 
     # Remove features we won't use at all (e.g. the weather_available missing-
     # indicator) before EDA, so they don't appear in the EDA tables either.
     enriched = drop_low_signal_features(enriched)
 
-    eda_main(enriched)                                # 3. EDA on the raw (untransformed) data
+    # -- Stage 3: EDA on the raw (untransformed) enriched data ----------------
+    if RUN_EDA:
+        eda_main(enriched)
 
-    # 4. EDA-informed transition (always runs, so the feature decisions are
-    #    visible even in an EDA-only run): drop identifiers + the redundant
-    #    features from the correlation/VIF analysis, then log-and-replace.
-    model_df = build_model_dataset(enriched)
-
-    if RUN_MODELS:
+    # -- Stages 4-6: EDA-informed transition, modelling, and results ----------
+    model_df = None
+    if RUN_MODELING:
+        # EDA-informed transition: drop identifiers + the redundant features
+        # from the correlation/VIF analysis, then log-and-replace the skewed
+        # counts. The log transform deliberately happens here, after EDA.
+        model_df = build_model_dataset(enriched)      # 4. build modelling dataset
         models_main(model_df)                         # 5-6. features + train + results
 
     print("\nDone.")
-    print(f"EDA dataset:       {enriched.shape[0]:,} rows x {enriched.shape[1]} columns")
-    print(f"Modelling dataset: {model_df.shape[0]:,} rows x {model_df.shape[1]} columns")
+    print(f"Enriched dataset:  {enriched.shape[0]:,} rows x {enriched.shape[1]} columns")
+    if model_df is not None:
+        print(f"Modelling dataset: {model_df.shape[0]:,} rows x {model_df.shape[1]} columns")
 
 
 if __name__ == "__main__":
