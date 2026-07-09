@@ -3905,11 +3905,16 @@ IMPORTANCE_PLOT_COLOURS = ("#F2CDB2", "#D4D8A7")
 # figure: two bars per feature need the vertical room.
 IMPORTANCE_COMPARISON_TOP_N = 12
 
-# Exact pixel width of the comparison figure. Achieved by sizing the canvas as
-# width_px / dpi and saving WITHOUT bbox_inches="tight", which would re-crop the
-# figure after rendering and silently change the output size. tight_layout()
-# reserves the margins instead, so the y-labels still fit.
+# Exact pixel size of the comparison figure. Achieved by sizing the canvas as
+# px / dpi and saving WITHOUT bbox_inches="tight", which would re-crop the figure
+# after rendering and silently change the output size. tight_layout() reserves the
+# margins instead, so the y-labels still fit.
+#
+# The height is FIXED, not derived from the number of rows: changing
+# IMPORTANCE_COMPARISON_TOP_N therefore changes the bar density, not the canvas.
+# Raise the height if a larger top-N ever makes the bars too thin to read.
 IMPORTANCE_PLOT_WIDTH_PX = 2800
+IMPORTANCE_PLOT_HEIGHT_PX = 2000
 IMPORTANCE_PLOT_DPI = 300
 
 # Shared by the top-k curve, the feature-group ablation, and the pairwise model
@@ -5129,8 +5134,10 @@ def plot_importance_comparison(
     positions = np.arange(len(top))
     height = 0.8 / len(ordered_models)
 
-    width_inches = IMPORTANCE_PLOT_WIDTH_PX / IMPORTANCE_PLOT_DPI
-    fig, ax = plt.subplots(figsize=(width_inches, 0.60 * len(top) + 1.8))
+    fig, ax = plt.subplots(figsize=(
+        IMPORTANCE_PLOT_WIDTH_PX / IMPORTANCE_PLOT_DPI,
+        IMPORTANCE_PLOT_HEIGHT_PX / IMPORTANCE_PLOT_DPI,
+    ))
     for i, name in enumerate(ordered_models):
         # Primary model on TOP of each group, so the visual order of the bars
         # matches the reading order of the legend.
