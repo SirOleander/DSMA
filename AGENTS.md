@@ -367,7 +367,18 @@ Numeric coefficients are per standard deviation (features are standardised insid
 
 Each subset rebuilds its pipeline through `build_models(X_train[columns])`. Reusing the full-feature pipeline would fail, because its `ColumnTransformer` names columns absent from the reduced frame.
 
-Outputs: `topk_feature_curve.csv`, `topk_feature_ranking.csv`, `plots/topk_feature_curve.png`.
+Outputs: `topk_feature_curve.csv`, `topk_feature_ranking.csv`, `plots/topk_feature_curve.png`, `plots/permutation_importance_top_features.png`.
+
+**There are two importance figures and they measure different things. Do not conflate them.**
+
+| Figure | Function | Permuted on | Models |
+|---|---|---|---|
+| `permutation_importance_top_features.png` | `plot_permutation_importance` | held-out **training** folds | the CV-best model only |
+| `feature_importance_by_model.png` | `plot_feature_importance` | the **test** set | top three by test Gini |
+
+The first is the ranking that drives the top-k curve and is safe to select features with. The second is descriptive only — nothing may be refitted from it. The paper should cite the first.
+
+Importances are a **ranking, not an additive decomposition**: they do not sum to the model's Gini. Magnitudes are estimator-specific (random forest and HistGradientBoosting agree on order, Spearman ρ = 0.82, but HGB assigns the user-characteristics block 0.112 Gini against the forest's 0.018). Report order as a property of the data and magnitude as a property of the model.
 
 **PCA was considered and rejected.** It produces linear combinations of all features rather than selecting a subset, so it cannot answer "which features matter"; it destroys the interpretability that `REQUIREMENTS.md` §15–16 demand; and it is poorly suited to a matrix that is mostly binary indicators. It would also break the gradient-boosting pipeline, which passes categoricals natively rather than one-hot. Do not add it.
 

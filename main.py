@@ -3872,6 +3872,7 @@ DO_TOPK_CURVE = True
 TOPK_VALUES = (5, 10, 25, 50, None)   # None = all features (the full model)
 TOPK_PERM_SAMPLE = 5_000              # held-out rows per fold used for importance
 TOPK_PERM_REPEATS = 3                 # shuffles per feature per fold
+TOPK_IMPORTANCE_PLOT_N = 15           # features shown in the importance figure
 
 # Every subset is scored on the SAME test rows, so their errors are correlated and
 # the difference between two subsets is estimated far more precisely than either
@@ -5010,6 +5011,58 @@ def paired_bootstrap_gini(
     return pd.DataFrame(rows)
 
 
+def plot_permutation_importance(
+    importance: pd.Series, model_name: str, top_n: int = TOPK_IMPORTANCE_PLOT_N,
+) -> Path:
+    """Horizontal bar chart of the top-n features, coloured by feature block.
+
+    Plots `cv_permutation_importance` output: importance measured on held-out
+    CROSS-VALIDATION FOLDS OF THE TRAINING SET, in Gini units. This is a different
+    quantity from plot_feature_importance(), which permutes on the TEST set across
+    the top three models. The two figures must not be confused; this one is the
+    ranking that drives the top-k curve, and it never touches the test set.
+    """
+    top = importance.head(top_n)[::-1]              # smallest at the bottom of the axes
+    blocks = [_group_membership(f) or "other" for f in top.index]
+
+    unique_blocks = sorted(set(blocks))
+    palette = dict(zip(unique_blocks, qualitative_palette("Pastel1", len(unique_blocks))))
+    colours = [palette[b] for b in blocks]
+
+    fig, ax = plt.subplots(figsize=(10, 0.42 * len(top) + 2.0))
+    ax.barh(range(len(top)), top.to_numpy(), color=colours, edgecolor="#5b6570", linewidth=0.4)
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels(top.index, fontsize=9)
+    ax.axvline(0, linewidth=1, color="#8a939d")
+
+    for i, value in enumerate(top.to_numpy()):
+        offset = 3 if value >= 0 else -3
+        ax.annotate(f"{value:.4f}", xy=(value, i), xytext=(offset, 0),
+                    textcoords="offset points", va="center",
+                    ha="left" if value >= 0 else "right", fontsize=8, color="#3d454d")
+
+    ax.set_xlabel("Permutation importance: GINI lost when the feature is shuffled")
+    ax.set_title(
+        f"Top {len(top)} features - {model_name}\n"
+        "cross-validated permutation importance on held-out training folds",
+        loc="left", fontweight="bold", fontsize=11,
+    )
+    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[b], ec="#5b6570", lw=0.4)
+               for b in unique_blocks]
+    ax.legend(handles, unique_blocks, title="feature block", frameon=False,
+              fontsize=8, title_fontsize=8, loc="lower right")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="x", linewidth=0.5, alpha=0.4)
+    ax.margins(x=0.16)
+    fig.tight_layout()
+
+    path = PLOT_DIR / "permutation_importance_top_features.png"
+    fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  saved {path}")
+    return path
+
+
 def plot_topk_curve(curve: pd.DataFrame, model_name: str) -> Path:
     """Test-set Gini as a function of feature-set size."""
     full = curve.iloc[-1]
@@ -5092,6 +5145,7 @@ def run_topk_curve(
 
     importance = cv_permutation_importance(reference, X_train, y_train)
     importance.to_csv(OUTPUT_DIR / "topk_feature_ranking.csv", header=["gini_drop"])
+    plot_permutation_importance(importance, model_name)
 
     rows = []
     scores_by_k = {}
