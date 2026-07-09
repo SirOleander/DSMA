@@ -204,6 +204,21 @@ WEATHER_FEATURE_COLS = WEATHER_NUMERIC_COLS + WEATHER_BINARY_COLS
 # full weather feature set; kept as a named alias to document that intent.
 WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 
+# NOAA is queried with units=metric, so temperatures are degrees Celsius and
+# depths are millimetres. Used only to label the weather summary table.
+WEATHER_UNITS = {
+    "weather_prcp": "mm",
+    "weather_snow": "mm",
+    "weather_snow_depth": "mm",
+    "weather_tmax": "deg C",
+    "weather_tmin": "deg C",
+    "weather_temp_range": "deg C",
+    "is_rainy": "0/1",
+    "is_snowy": "0/1",
+    "is_hot": "0/1",
+    "is_cold": "0/1",
+}
+
 # Global random seed (single source of truth).
 RANDOM_STATE = 42
 
@@ -2297,6 +2312,77 @@ def run_dataset_overview(df: pd.DataFrame) -> None:
         print_table(missing, "Variables with missing values", max_rows=25)
 
 
+def run_weather_summary(df: pd.DataFrame) -> None:
+    """Inventory the NOAA weather variables present in the clean dataset.
+
+    Weather missingness has two distinct sources and the table separates them:
+
+      unmatched  -- the review's city-date found no NOAA row at all, so *every*
+                    weather variable is missing on that row.
+      station_gap -- the row matched, but the station did not report that one
+                    variable that day. Snow depth is the usual culprit.
+
+    The binary flags are built from the numeric columns with .fillna(0) *before*
+    the merge (see clean_weather_data), so on a matched row they are never
+    missing: a day whose station reported no precipitation is coded is_rainy = 0,
+    indistinguishable from a genuinely dry day. Their station_gap is therefore 0
+    by construction, not by luck, and their prevalence is a mild underestimate.
+    """
+    print_section("Weather variables in the clean dataset")
+
+    numeric_cols = available_columns(df, WEATHER_NUMERIC_COLS)
+    binary_cols = available_columns(df, WEATHER_BINARY_COLS)
+    cols = numeric_cols + binary_cols
+    if not cols:
+        print("No weather variables found in the dataset.")
+        return
+
+    n_rows = len(df)
+    unmatched = int(df[cols].isna().all(axis=1).sum())
+
+    rows = []
+    for col in cols:
+        series = df[col]
+        present = int(series.notna().sum())
+        missing = n_rows - present
+        rows.append({
+            "variable": col,
+            "role": "binary" if col in binary_cols else "continuous",
+            "unit": WEATHER_UNITS.get(col, ""),
+            "rows_present": present,
+            "rows_missing": missing,
+            "missing_pct": round(missing / n_rows * 100, 2),
+            "station_gap": missing - unmatched,
+            "mean": series.mean(),
+            "min": series.min(),
+            "max": series.max(),
+            "in_model": "no" if col in DROP_FOR_REDUNDANCY else "yes",
+        })
+
+    print_table(
+        pd.DataFrame(rows),
+        f"NOAA weather variables ({len(cols)}) across {n_rows:,} reviews",
+        max_rows=len(cols),
+    )
+
+    print(
+        f"\nReviews with no NOAA match at all: {unmatched:,} "
+        f"({unmatched / n_rows * 100:.2f}%) -- missing on every weather variable."
+    )
+    dropped = [c for c in cols if c in DROP_FOR_REDUNDANCY]
+    if dropped:
+        print(
+            f"Dropped before modelling ({len(dropped)}): {', '.join(dropped)} -- "
+            "weather_temp_range = weather_tmax - weather_tmin is an exact identity, "
+            "so keeping all three would make the design matrix singular."
+        )
+    if "weather_available" in df.columns:
+        print(
+            "weather_available (the missing-indicator) is still present; it is "
+            "removed by drop_low_signal_features before the EDA tables."
+        )
+
+
 def run_numeric_summary(
     df: pd.DataFrame,
     columns: list[str] | None = None,
@@ -3455,6 +3541,7 @@ def eda_main(df: pd.DataFrame) -> None:
     print(f"Rows: {df.shape[0]:,} | Columns: {df.shape[1]:,}")
 
     run_dataset_overview(df)
+    run_weather_summary(df)
     run_target_analysis(df)
     run_satisfaction_by_group(df)
     run_satisfaction_by_category(df)
