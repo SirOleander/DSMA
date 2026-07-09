@@ -4621,10 +4621,17 @@ def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
 
 
 def plot_confusion(model, X_test, y_test, name: str) -> None:
-    """Save a confusion matrix for the given fitted model."""
+    """Save a confusion matrix for the given fitted model.
+
+    House style: no title, no colour bar (the counts are printed in the cells, so
+    the bar is redundant), plain box.
+    """
     cm = confusion_matrix(y_test, model.predict(X_test))
     disp = ConfusionMatrixDisplay(cm, display_labels=["not satisfied", "satisfied"])
-    disp.plot(cmap="Blues", values_format=",")
+    disp.plot(cmap="Blues", values_format=",", colorbar=False)
+    disp.ax_.set_xlabel("Predicted label")
+    disp.ax_.set_ylabel("True label")
+    apply_simple_plot_style(disp.ax_)
     plt.tight_layout()
     path = PLOT_DIR / f"confusion_matrix_{name}.png"
     plt.savefig(path, dpi=200, bbox_inches="tight")
@@ -5629,21 +5636,22 @@ def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
     print(f"\nSaved: {OUTPUT_DIR / 'learning_curve.csv'}")
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    palette = {"hist_gradient_boosting": "#0f766e", "logistic_regression": "#b45309"}
-    for name, block in curve.groupby("model"):
-        ax.plot(block["n_train"], block["gini"], marker="o", linewidth=2,
-                label=name, color=palette.get(name))
-    ax.axvline(MODEL_SAMPLE_N * 0.8, linestyle="--", linewidth=1, color="#8a939d")
-    ax.annotate("model-comparison\ntraining size (80k)",
-                xy=(MODEL_SAMPLE_N * 0.8, ax.get_ylim()[0]), xytext=(6, 12),
-                textcoords="offset points", fontsize=8, color="#5b6570")
+    # The 80k reference line (the model-comparison training size) is deliberately
+    # not drawn: the house style carries no reference lines. State it in the caption
+    # instead -- it is what makes the curve's message land.
+    palette = dict(zip(LEARNING_CURVE_MODELS, IMPORTANCE_PLOT_COLOURS))
+    for name in LEARNING_CURVE_MODELS:
+        block = curve[curve["model"] == name]
+        # Slightly heavier than the default: the pastel hues that read well as bar
+        # fills are faint as thin lines.
+        ax.plot(block["n_train"], block["gini"], marker="o", linewidth=2.6,
+                markersize=6, label=MODEL_DISPLAY_NAMES.get(name, name),
+                color=palette.get(name))
     ax.set_xscale("log")
     ax.set_xlabel("Training-set size (log scale)")
     ax.set_ylabel("Test-set GINI (fixed 250k held-out set)")
-    ax.set_title("Learning curve - does more data help?", loc="left", fontweight="bold")
-    ax.legend(frameon=False)
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(axis="y", linewidth=0.5, alpha=0.4)
+    ax.legend(loc="lower right")
+    apply_simple_plot_style(ax)
     fig.tight_layout()
     path = PLOT_DIR / "learning_curve.png"
     fig.savefig(path, dpi=200, bbox_inches="tight")
