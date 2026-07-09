@@ -3874,13 +3874,24 @@ TOPK_PERM_SAMPLE = 5_000              # held-out rows per fold used for importan
 TOPK_PERM_REPEATS = 3                 # shuffles per feature per fold
 TOPK_IMPORTANCE_PLOT_N = 15           # features shown in the importance figure
 
-# Every subset is scored on the SAME test rows, so their errors are correlated and
-# the difference between two subsets is estimated far more precisely than either
-# subset's Gini is. Comparing them against a single-model standard error would
-# therefore overstate the uncertainty of the difference. We resample the test rows
-# instead (a paired bootstrap), recompute every subset's Gini on each resample, and
-# take percentile intervals of both the level and the difference from the full model.
-TOPK_BOOTSTRAP = 1_000
+# Shared by the top-k curve, the feature-group ablation, and the pairwise model
+# comparison. Every variant is scored on the SAME test rows, so their errors are
+# correlated and the difference between two of them is estimated far more precisely
+# than either Gini is on its own. Comparing them against a single-model standard
+# error -- or against a cross-validation standard deviation, which measures fold-to-
+# fold stability rather than the uncertainty of a difference -- would overstate that
+# uncertainty. We resample the test rows instead (a paired bootstrap), recompute
+# every variant's Gini on each resample, and take percentile intervals of both the
+# level and the difference from a reference.
+PAIRED_BOOTSTRAP_RESAMPLES = 2_000
+
+# "Which model is best" is a claim about a difference, and differences need
+# intervals. run_model_comparison_bootstrap reports which models are statistically
+# indistinguishable from the best; run_importance_agreement then checks whether
+# those models rank the features the same way. If they disagree, reporting one
+# model's importances as "the" importances is unjustified.
+DO_MODEL_BOOTSTRAP = True
+DO_IMPORTANCE_AGREEMENT = True
 
 
 # ---------------------------------------------------------------------------
@@ -4973,9 +4984,15 @@ def paired_bootstrap_gini(
     n = len(y)
     keys = list(scores_by_key)
 
+    # The reported point estimate is the OBSERVED difference on the full test set.
+    # The bootstrap supplies the interval, not the estimate: the mean of the
+    # resampled deltas is a slightly different quantity and would disagree with the
+    # Gini values printed elsewhere in the same table.
+    observed = {k: 2 * roc_auc_score(y, s) - 1 for k, s in scores_by_key.items()}
+
     levels = {k: [] for k in keys}
     deltas = {k: [] for k in keys}
-    for _ in range(TOPK_BOOTSTRAP):
+    for _ in range(PAIRED_BOOTSTRAP_RESAMPLES):
         idx = rng.integers(0, n, n)
         y_b = y[idx]
         if y_b.min() == y_b.max():      # degenerate resample, no positive/negative
@@ -5001,7 +5018,7 @@ def paired_bootstrap_gini(
         rows.append({
             key_name: k,
             "gini_lo": lo, "gini_hi": hi,
-            "delta_vs_full": np.mean(deltas[k]),
+            "delta_vs_full": observed[k] - observed[reference_key],
             "delta_vs_full_lo": d_lo, "delta_vs_full_hi": d_hi,
             "delta_bonf_lo": b_lo, "delta_bonf_hi": b_hi,
             # "Significant" = the interval excludes zero.
@@ -5124,6 +5141,7 @@ def plot_topk_curve(curve: pd.DataFrame, model_name: str) -> Path:
 
 def run_topk_curve(
     model_name: str, best_params: dict, X_train, y_train, X_test, y_test,
+    importance: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Refit `model_name` on its top-k most important features and score on test.
 
@@ -5139,11 +5157,17 @@ def run_topk_curve(
     print("Feature ranking: permutation importance on held-out training folds.")
     print("The test set is used only to score each already-chosen subset.\n")
 
-    reference = build_models(X_train)[model_name]
-    if best_params.get(model_name):
-        reference.set_params(**best_params[model_name])
+    if importance is None:
+        reference = build_models(X_train)[model_name]
+        if best_params.get(model_name):
+            reference.set_params(**best_params[model_name])
+        importance = cv_permutation_importance(reference, X_train, y_train)
+    else:
+        # Already computed by run_importance_agreement with the identical method;
+        # recomputing it would cost a full permutation pass for the same numbers.
+        print("Reusing the ranking computed for the importance-agreement check.\n")
+        importance = importance.sort_values(ascending=False)
 
-    importance = cv_permutation_importance(reference, X_train, y_train)
     importance.to_csv(OUTPUT_DIR / "topk_feature_ranking.csv", header=["gini_drop"])
     plot_permutation_importance(importance, model_name)
 
@@ -5172,7 +5196,7 @@ def run_topk_curve(
     full_gini = curve.iloc[-1]["gini"]
     curve["gini_pct_of_full"] = 100 * curve["gini"] / full_gini
 
-    print(f"\nPaired bootstrap ({TOPK_BOOTSTRAP:,} resamples of the test rows) ...")
+    print(f"\nPaired bootstrap ({PAIRED_BOOTSTRAP_RESAMPLES:,} resamples of the test rows) ...")
     full_key = max(scores_by_k)          # the full-feature model is the reference
     ci = paired_bootstrap_gini(y_test, scores_by_k, reference_key=full_key)
     curve = curve.merge(ci, on="n_features", how="left")
@@ -5308,7 +5332,7 @@ def run_feature_group_ablation(
         rows.append({"removed_block": name, "n_features_removed": len(columns),
                      "n_features_used": len(remaining), "gini": metrics["gini"]})
 
-    print(f"\nPaired bootstrap ({TOPK_BOOTSTRAP:,} resamples of the test rows) ...")
+    print(f"\nPaired bootstrap ({PAIRED_BOOTSTRAP_RESAMPLES:,} resamples of the test rows) ...")
     ci = paired_bootstrap_gini(
         y_test, scores_by_key, reference_key="ALL BLOCKS", key_name="removed_block")
     table = (
@@ -5338,6 +5362,141 @@ def run_feature_group_ablation(
 
     table.to_csv(OUTPUT_DIR / "feature_group_ablation.csv", index=False)
     print(f"\nSaved: {OUTPUT_DIR / 'feature_group_ablation.csv'}")
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Pairwise model comparison
+# ---------------------------------------------------------------------------
+
+def run_model_comparison_bootstrap(fitted: dict, results: pd.DataFrame, X_test, y_test):
+    """Paired bootstrap of every tuned model against the best one.
+
+    Answers "how many models are genuinely tied for best?" without an arbitrary
+    cutoff. All models are scored on the SAME test rows, so a paired bootstrap of
+    the difference is far more sensitive than comparing each model's own interval,
+    or than comparing the gap to a cross-validation standard deviation (which
+    measures fold-to-fold stability, not the uncertainty of a difference).
+
+    Returns (table, indistinguishable) where `indistinguishable` lists the models
+    whose Bonferroni-adjusted interval against the best model contains zero -- the
+    reference itself included.
+    """
+    print_section("Pairwise model comparison (paired bootstrap, test set)")
+
+    scores = {}
+    for name, model in fitted.items():
+        y_score = get_scores(model, X_test)
+        if y_score is not None:
+            scores[name] = np.asarray(y_score)
+
+    best = results.iloc[0]["model"]      # results is sorted by SELECTION_METRIC
+    print(f"Reference (best on test by {SELECTION_METRIC.upper()}): {best}")
+    print(f"{PAIRED_BOOTSTRAP_RESAMPLES:,} resamples of {len(y_test):,} test rows, "
+          f"{len(scores) - 1} simultaneous comparisons (Bonferroni-adjusted).\n")
+
+    ci = paired_bootstrap_gini(y_test, scores, reference_key=best, key_name="model")
+    gini = results.set_index("model")[SELECTION_METRIC]
+    table = (
+        ci.assign(gini=ci["model"].map(gini))
+        .sort_values("gini", ascending=False)
+        .reset_index(drop=True)
+        .rename(columns={
+            "delta_vs_full": "delta_vs_best",
+            "delta_vs_full_lo": "ci95_lo", "delta_vs_full_hi": "ci95_hi",
+            "delta_bonf_lo": "bonf_lo", "delta_bonf_hi": "bonf_hi",
+            "differs_from_full": "differs_95", "differs_from_full_bonf": "differs_bonf",
+        })
+    )
+
+    show = table[["model", "gini", "delta_vs_best", "ci95_lo", "ci95_hi",
+                  "bonf_lo", "bonf_hi", "differs_95", "differs_bonf"]]
+    print("=" * 118)
+    print(f"PAIRED DIFFERENCE FROM {best.upper()} (test-set GINI)")
+    print("=" * 118)
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 220):
+        print(show.to_string(index=False))
+
+    indistinguishable = table.loc[~table["differs_bonf"], "model"].tolist()
+    print(f"\nStatistically indistinguishable from {best} at family-wise 95%: "
+          f"{', '.join(indistinguishable)}")
+    print(f"  -> {len(indistinguishable)} model(s) qualify for inspection, "
+          f"the reference included.")
+    print("\nA model whose Bonferroni interval excludes zero is genuinely worse, even")
+    print("if its raw Gini looks close. Do not use a cross-validation standard")
+    print("deviation as the cutoff: it measures stability, not this difference.")
+
+    path = OUTPUT_DIR / "model_pairwise_bootstrap.csv"
+    table.to_csv(path, index=False)
+    print(f"\nSaved: {path}")
+    return table, indistinguishable
+
+
+# ---------------------------------------------------------------------------
+# Feature-importance agreement across the indistinguishable models
+# ---------------------------------------------------------------------------
+
+def run_importance_agreement(
+    model_names: list[str], best_params: dict, X_train, y_train,
+) -> pd.DataFrame:
+    """Do the statistically tied models rank the features the same way?
+
+    Same method for each: cross-validated permutation importance on held-out
+    TRAINING folds, in Gini units. If the rankings agree, the ordering is a
+    property of the data; if they disagree, no single model's importances can be
+    presented as the project's feature importances.
+
+    Returns a frame of per-model importances (index = feature), also written to
+    feature_importance_agreement.csv. The caller can reuse a column to avoid
+    recomputing the same ranking for the top-k curve.
+    """
+    print_section("Feature-importance agreement across the tied models")
+
+    importances = {}
+    for name in model_names:
+        estimator = build_models(X_train)[name]
+        if best_params.get(name):
+            estimator.set_params(**best_params[name])
+        print(f"\n  {name}:")
+        importances[name] = cv_permutation_importance(estimator, X_train, y_train)
+
+    table = pd.DataFrame(importances)
+    table["block"] = [_group_membership(f) for f in table.index]
+
+    if len(model_names) < 2:
+        print(f"\nOnly one model qualifies ({model_names[0]}), so there is nothing to")
+        print("cross-check. Its importances stand on their own.")
+    else:
+        print("\n" + "=" * 100)
+        print("RANK AGREEMENT")
+        print("=" * 100)
+        for i, first in enumerate(model_names):
+            for second in model_names[i + 1:]:
+                # Spearman via pandas: no scipy dependency for one correlation.
+                rho = table[first].corr(table[second], method="spearman")
+                top_a = set(table[first].nlargest(10).index)
+                top_b = set(table[second].nlargest(10).index)
+                print(f"{first} vs {second}:")
+                print(f"  Spearman rho over all {len(table)} features: {rho:.3f}")
+                print(f"  top-10 overlap: {len(top_a & top_b)}/10")
+                if top_a - top_b:
+                    print(f"    only {first}: {sorted(top_a - top_b)}")
+                if top_b - top_a:
+                    print(f"    only {second}: {sorted(top_b - top_a)}")
+
+        print("\nBlock totals (summed importance per model):")
+        blocks = table.groupby("block")[model_names].sum()
+        with pd.option_context("display.float_format", "{:.5f}".format):
+            print(blocks.sort_values(model_names[0], ascending=False).to_string())
+
+        print("\nRead the ORDER as a property of the data and the MAGNITUDE as a")
+        print("property of the estimator: a high rank correlation with divergent")
+        print("magnitudes means the models agree on what matters, not on how much.")
+        print("Importances are a ranking, not an additive decomposition of Gini.")
+
+    path = OUTPUT_DIR / "feature_importance_agreement.csv"
+    table.to_csv(path)
+    print(f"\nSaved: {path}")
     return table
 
 
@@ -5628,6 +5787,16 @@ def models_main(df: pd.DataFrame) -> None:
     if "logistic_regression" in fitted:
         export_logistic_coefficients(fitted["logistic_regression"])
 
+    # ---- Which models are genuinely tied for best? ----
+    tied_models = [results.iloc[0]["model"]]
+    if DO_MODEL_BOOTSTRAP:
+        _, tied_models = run_model_comparison_bootstrap(fitted, results, X_test, y_test)
+
+    # ---- Do the tied models rank the features the same way? ----
+    agreement = None
+    if DO_IMPORTANCE_AGREEMENT:
+        agreement = run_importance_agreement(tied_models, best_params, X_train, y_train)
+
     if DO_TOPK_CURVE:
         # Pick the model for the curve from CROSS-VALIDATION, not from the test
         # table. Selecting it by test performance and then reporting test-set
@@ -5640,7 +5809,15 @@ def models_main(df: pd.DataFrame) -> None:
             topk_model = results.iloc[0]["model"]
             print(f"\nWARNING: DO_CV is off, so the curve model ({topk_model}) was")
             print("chosen using the test set. Enable DO_CV for a clean selection.")
-        run_topk_curve(topk_model, best_params, X_train, y_train, X_test, y_test)
+
+        # Reuse the ranking if the agreement check already produced it for this
+        # model. It may not have: the curve model is the CV-best, while the
+        # agreement check covers the models tied with the TEST-best.
+        precomputed = None
+        if agreement is not None and topk_model in agreement.columns:
+            precomputed = agreement[topk_model]
+        run_topk_curve(topk_model, best_params, X_train, y_train, X_test, y_test,
+                       importance=precomputed)
 
     if DO_GROUP_ABLATION:
         # Same model as the curve, chosen from cross-validation rather than the

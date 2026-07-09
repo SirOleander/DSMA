@@ -353,6 +353,22 @@ It is **idempotent** and called twice on purpose: inside `process_data` so newly
 
 Numeric coefficients are per standard deviation (features are standardised inside the pipeline). Categorical features are one-hot encoded with no dropped reference level, so their coefficients are relative to the L2-shrunk average level, not to a baseline category — read them against each other.
 
+## Pairwise model comparison
+
+`run_model_comparison_bootstrap` answers "how many models are genuinely tied for best?" with a paired bootstrap of test-set Gini against the best model, Bonferroni-corrected for the eight simultaneous comparisons. Output: `model_pairwise_bootstrap.csv`.
+
+- **Do not use the cross-validation standard deviation as the cutoff.** It measures fold-to-fold *stability*, not the uncertainty of a *difference between two models on held-out data*. The two answer different questions and give different verdicts here.
+- All models are scored on the same test rows, so their errors are correlated and the paired difference is estimated far more precisely than either model's own Gini interval. Overlapping level intervals do **not** imply no difference.
+- The set it returns drives `run_importance_agreement`: only the tied models are inspected for feature importance.
+
+## Feature-importance agreement
+
+`run_importance_agreement` computes cross-validated permutation importance for every model tied with the best, using the identical method, and reports the Spearman rank correlation and top-10 overlap between them (`feature_importance_agreement.csv`). Spearman comes from `pandas.Series.corr(method="spearman")` — do not add a scipy dependency for it.
+
+If the tied models disagree on the ranking, no single model's importances may be presented as the project's feature importances. They currently agree on **order** (ρ ≈ 0.82) but not on **magnitude**. Report order as a property of the data and magnitude as a property of the estimator; importances are a ranking, not an additive decomposition of Gini.
+
+`run_topk_curve` accepts the resulting ranking via its `importance=` argument so the same permutation pass is not paid for twice.
+
 ## Top-k feature-subset curve
 
 `run_topk_curve` refits the best model on its k most important features for k in `TOPK_VALUES` and scores each subset on the test set. It exists to turn the feature-ceiling claim into a measurement: if a small k recovers nearly the full-model Gini, the signal concentrates in a nameable handful of features (the managerial short-list) and the remaining features add almost nothing.
