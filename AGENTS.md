@@ -68,12 +68,11 @@ package or multiple modules.** Keep everything in the single file unless the use
 
 ## How to run
 
-- Requires Python 3 with: pandas, numpy, scikit-learn, matplotlib, requests, colorspace.
-  - The full modelling stage with `DO_GRID_SEARCH = True` searches 78 hyperparameter
-    configurations (234 fits at 3-fold) and takes on the order of an hour; KNN, the
-    MLP, and the random forest dominate. Set `DO_GRID_SEARCH = False` for fast reruns.
-  - `colorspace` is a hard import (used for the diagnostic plot palettes).
+- Requires Python 3.11 with pandas, numpy, matplotlib, requests, and **scikit-learn >= 1.4** (earlier versions lack `HistGradientBoostingClassifier(class_weight=...)` and `KBinsDiscretizer(encode="onehot-dense")`). See `zenvironment.yaml`; see `README.md` for the end-user runbook.
+  - The full modelling stage searches 187 hyperparameter configurations (561 fits at 3-fold). A complete `RUN_INGESTION + RUN_EDA + RUN_MODELING` run takes ~25 minutes. Set `DO_GRID_SEARCH = False` for fast reruns.
+  - `colorspace` is **optional**: it supplies the EDA palettes and `qualitative_palette` falls back to matplotlib colormaps when it is absent. A missing plotting dependency must never stop the modelling pipeline — do not restore the hard import.
   - `wordcloud` is optional: it is imported lazily and skipped if not installed.
+- **`DATA_DIR` is not hard-coded.** `_resolve_data_dir` checks `$DSMA_DATA_DIR`, then `./data` beside `main.py`, then `../data` beside the repo, accepting a candidate only if it already contains `raw/`. Do not replace this with an absolute path: the file is submitted as a report appendix and must run on a grader's machine.
 - Entry point: run `python main.py`.
 - The project is one linear pipeline, gated by three stage toggles at the top of
   the file (not inside `main()`):
@@ -319,6 +318,12 @@ Avoid purely technical changes that make the project harder to explain in the wr
 - Do not refactor broadly without being asked.
 - Preserve existing section headers and feature-change reporting prints where possible.
 - Explain why important decisions are made, not only what the code does.
+
+## NOAA weather download
+
+`download_weather_for_top_cities` **raises** if any city returns no data. It previously caught the per-city exception, printed a line, and continued: the affected reviews got `NaN` weather, which the modelling pipelines median-imputed without complaint. A transient NOAA outage therefore produced a quietly different dataset and quietly different results, with no error anywhere. Do not soften this back into a warning — a rerun that cannot reproduce the cached numbers is worse than a rerun that fails.
+
+The download is cached (`WEATHER_CACHE_PKL`) and is never repeated once written. Note that NOAA occasionally revises historical daily summaries, so a fresh download much later may differ marginally from the cache; say so in the paper's limitations.
 
 ## Business attribute levels
 

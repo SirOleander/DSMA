@@ -18,6 +18,7 @@ table are written to the output folders.
 
 import ast
 import json
+import os
 import re
 import warnings
 from pathlib import Path
@@ -29,7 +30,18 @@ import requests
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
-from colorspace import qualitative_hcl
+from matplotlib.colors import to_hex
+
+# colorspace supplies the EDA plot palettes. It is an uncommon package, and a
+# missing *plotting* dependency must not be able to stop the modelling pipeline
+# from running, so it is imported optionally (see qualitative_palette).
+try:
+    from colorspace import qualitative_hcl
+    _HAS_COLORSPACE = True
+except ImportError:                                     # pragma: no cover
+    qualitative_hcl = None
+    _HAS_COLORSPACE = False
+
 from sklearn.base import clone
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate, GridSearchCV
 from sklearn.inspection import permutation_importance
@@ -100,7 +112,32 @@ RUN_MODELING = True
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DATA_DIR = Path(r"C:\Users\fynne\University\Data Science and Marketing Analytics\data")
+def _resolve_data_dir() -> Path:
+    """Locate the data directory without hard-coding one machine's layout.
+
+    Order:
+      1. the DSMA_DATA_DIR environment variable, if set;
+      2. ./data beside this script      (the layout a grader gets: unzip and go);
+      3. ../data beside the repository  (the author's layout);
+      4. ./data, created on demand, if neither exists yet.
+
+    Candidates 2 and 3 are only accepted when they already contain a raw/
+    subdirectory, so an empty stub directory cannot shadow the real one.
+    """
+    override = os.environ.get("DSMA_DATA_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "data", here.parent / "data"):
+        if (candidate / "raw").is_dir():
+            return candidate
+    return here / "data"
+
+
+# Put the six exported raw CSVs in <DATA_DIR>/raw/ and nothing needs editing.
+# The processed/ and external/ subdirectories are created automatically.
+DATA_DIR = _resolve_data_dir()
 RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 EXTERNAL_DATA_DIR = DATA_DIR / "external"
@@ -193,6 +230,23 @@ warnings.filterwarnings(
 # ---------------------------------------------------------------------------
 # Printing primitives
 # ---------------------------------------------------------------------------
+
+# colorspace palette name -> nearest qualitative matplotlib colormap, used when
+# colorspace is not installed. Only the EDA figures change; no result depends on it.
+_FALLBACK_PALETTES = {"Warm": "Set2", "Pastel1": "Pastel1"}
+
+
+def qualitative_palette(name: str, n_colors: int) -> list[str]:
+    """Return n distinct hex colours from a named qualitative palette.
+
+    Uses colorspace when available and matplotlib otherwise, so a missing plotting
+    dependency degrades the figures rather than aborting the whole pipeline.
+    """
+    if _HAS_COLORSPACE:
+        return qualitative_hcl(name).colors(n_colors)
+    cmap = plt.get_cmap(_FALLBACK_PALETTES.get(name, "tab10"))
+    return [to_hex(cmap(i % cmap.N)) for i in range(n_colors)]
+
 
 def print_section(title: str) -> None:
     """Print a clear top-level section header."""
@@ -995,7 +1049,7 @@ def plot_yearly_review_count_and_missingness(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    palette = qualitative_hcl("Warm").colors(2)
+    palette = qualitative_palette("Warm", 2)
     count_color = palette[0]
     missing_color = palette[1]
 
@@ -1099,7 +1153,7 @@ def plot_top_city_review_count_and_missingness(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    colors = qualitative_hcl("Pastel1").colors(len(city_coverage))
+    colors = qualitative_palette("Pastel1", len(city_coverage))
 
     fig, ax_count = plt.subplots(figsize=(11, 7))
     y_positions = np.arange(len(city_coverage))
@@ -1215,7 +1269,7 @@ def plot_philadelphia_city_variants_before_standardization(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    colors = qualitative_hcl("Pastel1").colors(len(counts))
+    colors = qualitative_palette("Pastel1", len(counts))
 
     plt.figure(figsize=(10, 6))
     plt.barh(counts.index.astype(str), counts.values, color=colors)
@@ -1843,8 +1897,16 @@ def request_noaa_weather(station: str, start_date: str, end_date: str) -> pd.Dat
 
 
 def download_weather_for_top_cities(start_date: str, end_date: str) -> pd.DataFrame:
-    """Download NOAA weather for every selected city."""
+    """Download NOAA weather for every selected city.
+
+    Raises if ANY city fails. A partial download used to pass silently: the
+    affected reviews received NaN weather, which the modelling pipelines then
+    median-imputed without complaint, so a transient NOAA outage produced a
+    quietly different dataset and quietly different results. Failing loudly is
+    the only way a rerun can be trusted to reproduce the cached numbers.
+    """
     weather_frames = []
+    failed: list[str] = []
 
     for city_info in TOP_CITIES:
         city = city_info["city"]
@@ -1858,6 +1920,7 @@ def download_weather_for_top_cities(start_date: str, end_date: str) -> pd.DataFr
 
             if city_weather.empty:
                 print(f"No data returned for {city}, {state}")
+                failed.append(f"{city}, {state} ({station}): no rows returned")
                 continue
 
             city_weather["city"] = city
@@ -1867,10 +1930,24 @@ def download_weather_for_top_cities(start_date: str, end_date: str) -> pd.DataFr
 
         except requests.HTTPError as error:
             print(f"HTTP error for {city}, {state}: {error}")
+            failed.append(f"{city}, {state} ({station}): HTTP error: {error}")
         except requests.RequestException as error:
             print(f"Request error for {city}, {state}: {error}")
+            failed.append(f"{city}, {state} ({station}): request error: {error}")
 
         sleep(1)
+
+    if failed:
+        detail = "\n  ".join(failed)
+        raise RuntimeError(
+            f"NOAA weather download incomplete: {len(failed)} of {len(TOP_CITIES)} "
+            f"cities returned no data.\n  {detail}\n\n"
+            "The pipeline stops here on purpose. Continuing would leave those cities' "
+            "reviews with missing weather, which the modelling pipelines would silently "
+            "median-impute, producing results that differ from a complete run without "
+            "any visible error. Re-run when NOAA is reachable, or delete the affected "
+            "cities from TOP_CITIES and document the change."
+        )
 
     if not weather_frames:
         raise ValueError("No NOAA weather data were downloaded.")
@@ -2618,7 +2695,7 @@ def run_satisfaction_by_category(df: pd.DataFrame, top_n: int = 15) -> None:
     )
 
     plot_df = top.sort_values("satisfaction_rate_percent")
-    colors = qualitative_hcl("Pastel1").colors(len(plot_df))
+    colors = qualitative_palette("Pastel1", len(plot_df))
     plt.figure(figsize=(11, 7))
     plt.barh(plot_df["category"].astype(str), plot_df["satisfaction_rate_percent"], color=colors)
     plt.axvline(overall, color="0.35", linestyle="--", linewidth=1.2)

@@ -1,14 +1,24 @@
 name: dsma
 channels:
-  - defaults
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
   - openpyxl
   - requests
   - pip
   - pip:
-    - pandas 
-    - pyflakes
-    - scikit-learn
-    - colorspace
+      - pandas>=2.0
+      - numpy>=1.24
+      # matplotlib is imported at module level in main.py; without it nothing runs.
+      - matplotlib>=3.7
+      # >=1.4 required: HistGradientBoostingClassifier(class_weight=...) and
+      # KBinsDiscretizer(encode="onehot-dense") do not exist before it.
+      - scikit-learn>=1.4
+      # Optional: supplies the EDA plot palettes. main.py falls back to matplotlib
+      # colormaps if it is missing, so a failed install is not fatal.
+      - colorspace
+      # Optional: used for one EDA word-cloud figure, imported lazily.
+      - wordcloud
+      # Development only: `python -m pyflakes main.py`.
+      - pyflakes
