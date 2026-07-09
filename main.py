@@ -18,8 +18,10 @@ table are written to the output folders.
 
 import ast
 import json
+import re
+import warnings
 from pathlib import Path
-from time import sleep
+from time import perf_counter, sleep
 
 import numpy as np
 import pandas as pd
@@ -28,13 +30,18 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
 from colorspace import qualitative_hcl
+from sklearn.base import clone
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate, GridSearchCV
 from sklearn.inspection import permutation_importance
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, OrdinalEncoder
-from sklearn.dummy import DummyClassifier
+from sklearn.preprocessing import (
+    StandardScaler,
+    OneHotEncoder,
+    OrdinalEncoder,
+    KBinsDiscretizer,
+)
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import LinearSVC
 from sklearn.tree import DecisionTreeClassifier
@@ -44,10 +51,9 @@ from sklearn.ensemble import (
     BaggingClassifier,
 )
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.naive_bayes import GaussianNB
+from sklearn.naive_bayes import BernoulliNB
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import (
-    accuracy_score,
     balanced_accuracy_score,
     precision_score,
     recall_score,
@@ -89,7 +95,7 @@ from sklearn.metrics import (
 # download stays cached (WEATHER_CACHE_PKL), so it is not re-downloaded.
 RUN_INGESTION = False
 RUN_EDA = True
-RUN_MODELING = False
+RUN_MODELING = True
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -163,6 +169,21 @@ WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 
 # Global random seed (single source of truth).
 RANDOM_STATE = 42
+
+# The Naive Bayes preprocessor quantile-bins the continuous features. Several of
+# them are zero-inflated (weather_snow is 76% zeros, log_tip_compliment_count
+# 60%, log_user_fans 48%) or near-discrete (hours_open_days_count has 8 distinct
+# values), so they cannot be cut into 20 distinct quantiles. scikit-learn drops
+# the degenerate zero-width bins and warns once per feature per fit -- correct
+# behaviour, but it emitted 525 identical warnings across a grid search. The
+# warning is silenced here, not the behaviour: a feature simply ends up with
+# fewer effective bins than requested, which is exactly what we want.
+warnings.filterwarnings(
+    "ignore",
+    message="Bins whose width are too small",
+    category=UserWarning,
+    module="sklearn.preprocessing._discretization",
+)
 
 
 # ================================================================================
@@ -838,6 +859,56 @@ def merge_tables(
     )
 
     return dataset
+
+# Yelp stores nested business attributes as PYTHON 2 REPR STRINGS, so the same
+# level arrives under two spellings: "u'quiet'" and "'quiet'". Left untouched they
+# become two separate one-hot columns, splitting a single effect across two
+# coefficients and inflating the design matrix. Observed on NoiseLevel, Alcohol,
+# WiFi, RestaurantsAttire and others.
+_QUOTED_LEVEL = re.compile(r"^[ub]?(['\"])(?P<value>.*)\1$")
+
+
+def _strip_python_repr_quotes(value):
+    """u'quiet' -> quiet, 'quiet' -> quiet, Unknown -> Unknown."""
+    if not isinstance(value, str):
+        return value
+    match = _QUOTED_LEVEL.match(value.strip())
+    return match.group("value") if match else value.strip()
+
+
+def normalize_attribute_levels(dataset: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the u'x' / 'x' duplicate levels in the attributes.* columns.
+
+    Idempotent: running it on already-clean data changes nothing. It is called
+    both during ingestion (so newly built caches are clean) and after loading a
+    cached dataset (so caches built before this fix are repaired on load).
+    """
+    dataset = dataset.copy()
+    columns = [c for c in dataset.columns if c.startswith("attributes.")]
+    merged = {}
+
+    for column in columns:
+        series = dataset[column]
+        if not (isinstance(series.dtype, pd.CategoricalDtype)
+                or pd.api.types.is_object_dtype(series)
+                or pd.api.types.is_string_dtype(series)):
+            continue
+        as_text = series.astype("string")
+        before = as_text.nunique(dropna=True)
+        cleaned = as_text.map(_strip_python_repr_quotes)
+        after = cleaned.nunique(dropna=True)
+        dataset[column] = cleaned.astype("category")
+        if after < before:
+            merged[column] = (before, after)
+
+    if merged:
+        print_subsection("Normalising Python-2 repr strings in business attributes")
+        for column, (before, after) in merged.items():
+            print(f"  {column:45s} {before:>2} -> {after:>2} levels")
+        print(f"  collapsed {sum(b - a for b, a in merged.values())} duplicate levels "
+              f"across {len(merged)} columns")
+    return dataset
+
 
 def clean_values(dataset: pd.DataFrame) -> pd.DataFrame:
     """Clean obvious missing values and create simple derived variables."""
@@ -1631,6 +1702,7 @@ def process_data(tables: dict) -> pd.DataFrame:
 
     print("\nCleaning values...")
     clean_before = list(dataset.columns)
+    dataset = normalize_attribute_levels(dataset)
     dataset = clean_values(dataset)
     plot_yearly_review_count_and_missingness(
         dataset=dataset,
@@ -3340,17 +3412,41 @@ POST_REVIEW_COLS = [
 # Features removed after EDA because of multicollinearity / VIF. Names are given
 # in their pre-log form; the drop step below removes whichever form (raw or
 # log_) actually exists after the log-and-replace.
+# Features removed at the EDA-to-modelling transition. This list must stay in
+# agreement with what the EDA's correlation/VIF screening actually removes,
+# otherwise the EDA reports a reduced feature set that the models never use --
+# and the paper's EDA and modelling sections contradict each other.
+#
+# Two provenances, deliberately kept separate:
+#
+#   (a) STRUCTURAL. Justified by an exact algebraic identity, not by a VIF
+#       threshold. The iterative VIF loop only partially detects these: once it
+#       removes two photo sub-types the remaining ones fall below the threshold
+#       and it stops, even though photo_count is still their exact sum.
+#   (b) EDA SCREENING. The correlation/VIF casualties the EDA actually reports.
+#       Recomputed from run_eda_correlation_workflows; if the screening changes,
+#       update this list to match.
 DROP_FOR_REDUNDANCY = [
-    # Photo sub-types: photo_count is their exact sum (near-perfect dependency,
-    # VIF -> infinity). Keep photo_count.
+    # -- (a) structural: exact identities -----------------------------------
+    # photo_count is the exact sum of its five sub-types (VIF -> infinity).
     "photo_food", "photo_drink", "photo_menu", "photo_inside", "photo_outside",
-    # Temperature: weather_temp_range = tmax - tmin (near-perfect dependency).
-    # Keep weather_tmax and weather_temp_range.
+    # weather_temp_range = weather_tmax - weather_tmin (exact).
     "weather_tmin",
+
+    # -- (b) EDA correlation/VIF casualties ---------------------------------
     # User votes: severe multicollinearity (VIF >> 10). Keep user_useful.
     "user_funny", "user_cool",
     # Business activity: moderate multicollinearity. Keep business_review_count.
     "checkin_count", "tip_count",
+    # Opening-hours block. The weekly and weekend totals are sums of the daily
+    # durations, and the individual weekday durations are near-collinear with
+    # one another. Keep monday/tuesday/friday/sunday and hours_open_days_count.
+    "hours_duration_wednesday", "hours_duration_thursday", "hours_duration_saturday",
+    "hours_total_weekly_open_hours", "hours_weekend_open_hours",
+    # Binary casualties: hours_weekend_open is implied by the saturday/sunday
+    # open flags; category_nightlife overlaps category_bars.
+    "hours_open_thursday", "hours_open_saturday", "hours_weekend_open",
+    "category_nightlife",
 ]
 
 # Features we don't use at all, removed BEFORE the EDA so they don't appear in
@@ -3640,14 +3736,161 @@ DO_CV = True
 CV_FOLDS = 3
 CV_SUBSAMPLE = 300_000
 
-# Focused hyperparameter search on the top models (HGB + random forest), and a
-# permutation-importance plot across all models. Both are extra work, so they
-# run on subsamples; set the DO_ flags to False to skip.
+# Hyperparameter search across every tunable model, and a permutation-importance
+# plot across all models. Both are extra work, so they run on subsamples; set the
+# DO_ flags to False to skip. With DO_GRID_SEARCH off, the models keep the
+# documented default hyperparameters hard-coded in build_models().
 DO_GRID_SEARCH = True
 GRID_SAMPLE = 30_000
 DO_FEATURE_IMPORTANCE = True
 PERM_SAMPLE = 3_000      # rows used for permutation importance (KNN is the bottleneck)
 PERM_REPEATS = 5
+
+# Fit the un-tuned (default) models on the training set as a reference pass, so
+# the report can quantify what the hyperparameter search was actually worth.
+# Costs one extra fit of every model; set False to skip.
+DO_UNTUNED_COMPARISON = True
+
+# ---------------------------------------------------------------------------
+# Top-k feature-subset curve (parsimony / feature-ceiling evidence)
+# ---------------------------------------------------------------------------
+# Refits the best model on its k most important features, for a range of k, and
+# scores each subset on the held-out test set. If a small k recovers nearly the
+# full-model Gini, then (a) the signal concentrates in a nameable handful of
+# features -- the managerial short-list -- and (b) the remaining features add
+# almost nothing, which is the feature ceiling stated as a measurement rather
+# than an assertion.
+#
+# LEAKAGE RULE: the feature ranking is computed with permutation importance on
+# held-out CROSS-VALIDATION FOLDS OF THE TRAINING SET, never on the test set.
+# Ranking features by their test-set importance and then reporting test-set
+# performance would be circular: the test set would have chosen the features.
+# The test set is used only to score each already-chosen subset.
+#
+# The curve is DESCRIPTIVE. Do not pick a k from it and then report that k's
+# test score as the headline model -- that would reintroduce selection on test.
+# Feature-group ablation: remove one block of features at a time, refit, and
+# measure the Gini it costs. This is what answers REQUIREMENTS.md 17's
+# subquestions 2-5 ("do engagement / user / timing / weather features add
+# predictive value?"), which permutation importance cannot answer because
+# correlated features inside a block mask one another.
+DO_GROUP_ABLATION = True
+
+# ---------------------------------------------------------------------------
+# Learning curve (the data-volume half of the feature-ceiling claim)
+# ---------------------------------------------------------------------------
+# The model comparison runs on a 100k subsample because KNN, the linear SVM and
+# the MLP cannot scale. That leaves "more data would not help" asserted rather
+# than measured. The learning curve measures it: fit the two models that DO scale
+# cheaply on training sets of increasing size and score each on one fixed held-out
+# test set. If the curve is flat past ~100k, the ceiling is not a data-volume
+# ceiling. It uses its own split of the full ~2.9M-row dataset and is a separate
+# experiment from the model comparison -- say so when reporting it.
+DO_LEARNING_CURVE = True
+LEARNING_CURVE_MODELS = ("hist_gradient_boosting", "logistic_regression")
+LEARNING_CURVE_SIZES = (10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000)
+LEARNING_CURVE_TEST_SIZE = 250_000
+
+DO_TOPK_CURVE = True
+TOPK_VALUES = (5, 10, 25, 50, None)   # None = all features (the full model)
+TOPK_PERM_SAMPLE = 5_000              # held-out rows per fold used for importance
+TOPK_PERM_REPEATS = 3                 # shuffles per feature per fold
+
+# Every subset is scored on the SAME test rows, so their errors are correlated and
+# the difference between two subsets is estimated far more precisely than either
+# subset's Gini is. Comparing them against a single-model standard error would
+# therefore overstate the uncertainty of the difference. We resample the test rows
+# instead (a paired bootstrap), recompute every subset's Gini on each resample, and
+# take percentile intervals of both the level and the difference from the full model.
+TOPK_BOOTSTRAP = 1_000
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameter search space (one grid per model)
+# ---------------------------------------------------------------------------
+# Searched with GridSearchCV on the TRAINING set only, scored by ROC-AUC. The
+# inner StratifiedKFold folds are the validation mechanism: each configuration is
+# scored on held-out folds, so no separate validation split is needed and the
+# test set is never involved.
+#
+# Models absent from this dict, or mapped to an empty grid, are left at their
+# build_models() defaults. Parameter names are pipeline-scoped: "model__C" is C
+# on the final estimator, and "model__estimator__max_depth" reaches the base tree
+# nested inside BaggingClassifier.
+#
+# Notes on what is deliberately *not* searched:
+#   - svm_linear keeps dual=False, which forces loss="squared_hinge", so C is
+#     genuinely the only knob it has.
+#   - logistic_regression uses the lbfgs solver, which supports L2 only. L1
+#     (sparse coefficients) would require solver="saga", which converges slowly
+#     on a one-hot matrix this wide; not worth the runtime here.
+#   - naive_bayes has exactly one hyperparameter.
+#   - hist_gradient_boosting does not tune max_iter: early stopping (set in
+#     build_models) already decides the iteration count, so max_iter is a cap.
+# Grid ranges: an earlier run had six of nine winners sitting on a grid boundary,
+# almost all pointing the same way (toward more regularisation / simpler models).
+# A boundary winner means the search wanted to keep going and was cut off, so the
+# reported optimum is an artefact of the range. Every grid below now brackets the
+# previous winner with values on BOTH sides. run_grid_search flags any remaining
+# boundary hit; if one appears, widen that axis again rather than ignoring it.
+PARAM_GRIDS: dict[str, dict] = {
+    "logistic_regression": {
+        # Previous winner C=0.01 was the smallest offered: it wanted more penalty.
+        "model__C": [0.0001, 0.001, 0.01, 0.1, 1.0],
+    },
+    "svm_linear": {
+        # Same story as the logit: C=0.01 was the floor of the old grid.
+        "model__C": [0.0001, 0.001, 0.01, 0.1, 1.0],
+    },
+    "knn": {
+        # n_neighbors=400 was the ceiling of the previous grid; it wanted more
+        # smoothing still. `weights` is deliberately NOT tuned (see build_models).
+        "model__n_neighbors": [100, 200, 400, 800, 1600],
+    },
+    "naive_bayes": {
+        # Bin count controls how finely each continuous feature is discretised:
+        # the bias/variance knob of a nonparametric density.
+        "pre__num_cont__bin__n_bins": [5, 10, 20],
+        # Laplace/Lidstone smoothing (R's fL).
+        "model__alpha": [0.01, 0.1, 1.0, 10.0],
+    },
+    "neural_net": {
+        # Previous winner: alpha=1e-3 (ceiling) with the widest single layer.
+        "model__hidden_layer_sizes": [(64,), (128,), (256,), (64, 32)],
+        "model__alpha": [1e-4, 1e-3, 1e-2, 1e-1],
+    },
+    "decision_tree": {
+        # Previous winner sat at BOTH boundaries: shallowest depth, largest leaf.
+        "model__max_depth": [4, 6, 8, 12],
+        "model__min_samples_leaf": [50, 100, 200],
+        "model__criterion": ["gini", "entropy"],
+    },
+    "bagging": {
+        # The old winner wanted more complexity, but that was measured on an
+        # unweighted bagging model (the class_weight bug). Bracket both ways.
+        "model__estimator__max_depth": [12, 16, 20],
+        "model__estimator__min_samples_leaf": [20, 50],
+        # max_features < 1.0 subsamples columns per base tree: this is precisely
+        # what separates plain bagging from a random forest.
+        "model__max_features": [0.5, 1.0],
+    },
+    "random_forest": {
+        # Previous winner: max_depth=12 (floor), min_samples_leaf=20 (floor),
+        # max_features=0.5 (ceiling). Extend all three.
+        "model__max_depth": [8, 12, 16],
+        "model__min_samples_leaf": [10, 20, 50],
+        # After depth, max_features is the most consequential forest knob: it
+        # controls how decorrelated the trees are.
+        "model__max_features": ["sqrt", 0.5, 0.8],
+    },
+    "hist_gradient_boosting": {
+        # Previous winner sat on the regularising boundary of all four axes.
+        "model__learning_rate": [0.01, 0.05, 0.1],
+        "model__max_leaf_nodes": [15, 31, 63],
+        "model__l2_regularization": [0.0, 1.0, 10.0],
+        "model__min_samples_leaf": [20, 50, 100],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -3693,6 +3936,54 @@ def build_ordinal_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list
 # Model definitions
 # ---------------------------------------------------------------------------
 
+def build_nb_preprocessor(X: pd.DataFrame, n_bins: int = 10) -> ColumnTransformer:
+    """Distribution-free preprocessor for Naive Bayes: everything becomes binary.
+
+    GaussianNB was the wrong likelihood for this feature set. It fits a mean and a
+    variance to every column, including the one-hot city indicators and the binary
+    attribute flags, which take only the values 0 and 1 and are in no sense
+    Gaussian; and to zero-inflated counts, which are not Gaussian either.
+
+    Instead:
+      - continuous numerics are cut into QUANTILE bins, then one-hot encoded,
+      - binary numerics (0/1 flags) pass through untouched, already indicators,
+      - categoricals are one-hot encoded,
+    and BernoulliNB estimates one probability per indicator. Nothing assumes a
+    parametric density, which is the same idea as R's `usekernel = TRUE`.
+
+    A useful consequence: quantile binning is invariant to any monotone transform,
+    so this model gives identical results whether or not the skewed counts were
+    log-transformed upstream. (The log transform stays, because the linear and
+    distance-based models still need it.)
+    """
+    numeric, categorical = split_feature_types(X)
+    binary = [c for c in numeric if is_binary_numeric_series(X[c])]
+    continuous = [c for c in numeric if c not in binary]
+
+    continuous_pipe = Pipeline([
+        ("impute", SimpleImputer(strategy="median")),
+        ("bin", KBinsDiscretizer(
+            n_bins=n_bins, encode="onehot-dense", strategy="quantile",
+        )),
+    ])
+    binary_pipe = Pipeline([("impute", SimpleImputer(strategy="most_frequent"))])
+    categorical_pipe = Pipeline([
+        ("impute", SimpleImputer(strategy="constant", fill_value="Unknown")),
+        ("encode", OneHotEncoder(
+            handle_unknown="ignore", min_frequency=50, sparse_output=False,
+        )),
+    ])
+
+    return ColumnTransformer(
+        transformers=[
+            ("num_cont", continuous_pipe, continuous),
+            ("num_bin", binary_pipe, binary),
+            ("cat", categorical_pipe, categorical),
+        ],
+        remainder="drop",
+    )
+
+
 def build_models(X_train: pd.DataFrame) -> dict:
     """Build the candidate models, each as a complete leakage-safe Pipeline.
 
@@ -3700,17 +3991,27 @@ def build_models(X_train: pd.DataFrame) -> dict:
       - scaled_pre (standardised + dense one-hot): logit, SVM, KNN, NB, MLP
       - ordinal_pre (-1 sentinel, no scaling):     decision tree, bagging, RF
       - hgb_pre (NaN + native categoricals):       histogram gradient boosting
-    class_weight="balanced" is set where the estimator supports it; KNN, NB and
-    the MLP have no such parameter and rely on the balanced metrics instead.
+    class_weight="balanced" is set wherever it is reachable: directly on the
+    estimator, or (for bagging) on its base tree. KNN, NB and the MLP expose no
+    such parameter anywhere and rely on the balanced metrics instead. Because of
+    that, their accuracy is NOT comparable with the balanced models': they score
+    above the no-information rate by mostly predicting the majority class.
+
+    The hyperparameter values below are the defaults used when DO_GRID_SEARCH is
+    off. When it is on, run_grid_search overwrites the tunable ones (PARAM_GRIDS)
+    before the models are fit. Values kept deliberately fixed rather than tuned:
+      - class_weight="balanced" is the documented imbalance strategy, not a knob.
+      - n_estimators (RF, bagging): more trees is monotonically non-worse in
+        expectation, so searching it only buys compute.
+      - The tree depth / min_samples_leaf caps below were added because the
+        unconstrained ensembles reached train ROC-AUC = 1.0. The grids search
+        *within* those caps; none of them offers max_depth=None.
     """
     scaled_pre, _, _ = build_preprocessor(X_train, scale_numeric=True)
     ordinal_pre, _, _ = build_ordinal_preprocessor(X_train)
     hgb_pre, cat_mask = build_tree_preprocessor(X_train)
 
     return {
-        "baseline_most_frequent": Pipeline([
-            ("model", DummyClassifier(strategy="most_frequent")),
-        ]),
         "logistic_regression": Pipeline([
             ("pre", scaled_pre),
             ("model", LogisticRegression(
@@ -3732,11 +4033,23 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "knn": Pipeline([
             ("pre", scaled_pre),
-            ("model", KNeighborsClassifier(n_neighbors=25, n_jobs=-1)),
+            # weights="uniform" is fixed, not a tunable. With weights="distance" a
+            # training point is its own neighbour at distance 0, so it takes
+            # infinite weight and the model reproduces the training labels exactly
+            # (train ROC-AUC = 1.000) -- a definitional artefact, not overfitting,
+            # that makes the training row uninterpretable. Measured cost of
+            # forcing uniform: 0.0175 GINI on the test set (0.2721 -> 0.2546).
+            ("model", KNeighborsClassifier(
+                n_neighbors=25, weights="uniform", n_jobs=-1,
+            )),
         ]),
         "naive_bayes": Pipeline([
-            ("pre", scaled_pre),
-            ("model", GaussianNB()),
+            # Bernoulli NB over quantile-binned features: no parametric density
+            # assumption anywhere. See build_nb_preprocessor.
+            ("pre", build_nb_preprocessor(X_train)),
+            # alpha is Laplace/Lidstone smoothing -- the same knob R's naiveBayes
+            # calls fL. GaussianNB had no equivalent, only var_smoothing.
+            ("model", BernoulliNB(alpha=1.0)),
         ]),
         "neural_net": Pipeline([
             ("pre", scaled_pre),
@@ -3763,8 +4076,18 @@ def build_models(X_train: pd.DataFrame) -> dict:
             # Default bagging uses unpruned trees -> train ROC-AUC = 1.0. Bound
             # the base tree's depth and leaf size so it generalises instead of
             # memorising.
+            # BaggingClassifier itself has no class_weight, but its base tree
+            # does, and setting it there is what balances the ensemble. Without
+            # it bagging silently optimises raw accuracy on a 70/30 target: it
+            # scored 0.717 accuracy with recall_dissat = 0.15, i.e. it mostly
+            # predicted "satisfied". Keep this in step with decision_tree and
+            # random_forest, which set class_weight directly.
             ("model", BaggingClassifier(
-                estimator=DecisionTreeClassifier(max_depth=16, min_samples_leaf=50),
+                estimator=DecisionTreeClassifier(
+                    max_depth=16,
+                    min_samples_leaf=50,
+                    class_weight="balanced",
+                ),
                 n_estimators=50,
                 n_jobs=-1,
                 random_state=RANDOM_STATE,
@@ -3785,9 +4108,20 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "hist_gradient_boosting": Pipeline([
             ("pre", hgb_pre),
+            # early_stopping is set explicitly rather than left at 'auto'. 'auto'
+            # resolves to True whenever n_samples > 10_000, which is always the
+            # case here, so it was already silently on: max_iter acted as a mere
+            # upper bound. Making it explicit means max_iter is a stated cap and
+            # the grid tunes the parameters that actually bind (learning rate,
+            # leaf count, L2). The internal validation slice is carved out of the
+            # training fold only, so it introduces no test-set leakage.
             ("model", HistGradientBoostingClassifier(
                 categorical_features=cat_mask,
                 class_weight="balanced",
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=10,
+                max_iter=500,
                 random_state=RANDOM_STATE,
             )),
         ]),
@@ -3833,7 +4167,9 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
     actionable) dissatisfied minority.
     """
     metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
+        # Plain accuracy is deliberately NOT computed: with a 69.71% positive rate
+        # it is uninterpretable (an always-predict-satisfied rule scores 0.6971)
+        # and it inverts the true model ranking. Balanced accuracy replaces it.
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
@@ -3844,16 +4180,25 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
         "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
     }
     if y_score is not None:
+        # ROC-AUC is computed but never reported: gini = 2*AUC - 1 is a strictly
+        # increasing rescaling of it, so Gini carries exactly the same information
+        # and ranks models identically. Gini is the reported and ranked metric.
         roc = roc_auc_score(y_true, y_score)
-        metrics["roc_auc"] = roc
-        metrics["gini"] = 2 * roc - 1            # Gini = 2*AUC - 1 (rescaling of AUC)
-        metrics["pr_auc"] = average_precision_score(y_true, y_score)
+        metrics["gini"] = 2 * roc - 1
+        # PR-AUC for the dissatisfied minority. Unlike ROC-AUC, average precision
+        # is NOT invariant to the class prior: its no-skill baseline equals the
+        # rate of the class being scored. For satisfied (~70%) that floor is
+        # 0.697, which flatters the model; for dissatisfied (~30%) it is 0.303.
+        # Only the minority version is computed -- the satisfied-class PR-AUC is
+        # misleading under this imbalance and is deliberately not produced.
+        # y_score ranks the satisfied class, so it is negated to rank dissatisfied.
+        y_dissat = (np.asarray(y_true) == 0).astype(int)
+        metrics["pr_auc_dissat"] = average_precision_score(y_dissat, -np.asarray(y_score))
         metrics["top_decile_lift"] = top_decile_lift(y_true, y_score, pos_label=1)
         metrics["top_decile_lift_dissat"] = top_decile_lift(y_true, y_score, pos_label=0)
     else:
-        metrics["roc_auc"] = np.nan
         metrics["gini"] = np.nan
-        metrics["pr_auc"] = np.nan
+        metrics["pr_auc_dissat"] = np.nan
         metrics["top_decile_lift"] = np.nan
         metrics["top_decile_lift_dissat"] = np.nan
     return metrics
@@ -3873,32 +4218,245 @@ def get_scores(model, X) -> np.ndarray | None:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_holdout(
-    models, X_train, X_test, y_train, y_test
-) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
-    """Fit each model on train; return full metric tables for both the held-out
-    test set and the training set. Returns (test_results, fitted, train_results)."""
-    test_rows = []
-    train_rows = []
-    fitted = {}
+def fit_and_time(models, X_train, y_train) -> tuple[dict, dict]:
+    """Fit each model on the training set, recording wall-clock fit seconds.
 
+    Fit time is a reported column in the evaluation tables, so it is measured
+    here rather than estimated. It covers the whole pipeline (preprocessing +
+    estimator), which is what a practitioner actually pays.
+    """
+    fitted = {}
+    seconds = {}
     for name, model in models.items():
         print(f"  fitting {name} ...")
+        start = perf_counter()
         model.fit(X_train, y_train)
+        seconds[name] = perf_counter() - start
         fitted[name] = model
+    return fitted, seconds
 
-        test_rows.append({"model": name, **compute_metrics(
-            y_test, model.predict(X_test), get_scores(model, X_test))})
-        train_rows.append({"model": name, **compute_metrics(
-            y_train, model.predict(X_train), get_scores(model, X_train))})
 
-    test_results = pd.DataFrame(test_rows).sort_values("roc_auc", ascending=False).reset_index(drop=True)
-    train_results = pd.DataFrame(train_rows).sort_values("roc_auc", ascending=False).reset_index(drop=True)
-    return test_results, fitted, train_results
+def evaluate_fitted(fitted, X, y, seconds: dict | None = None) -> pd.DataFrame:
+    """Score already-fitted models on (X, y). Never fits, so it is safe to call
+    on the test set without re-touching training data."""
+    rows = []
+    for name, model in fitted.items():
+        row = {"model": name, **compute_metrics(y, model.predict(X), get_scores(model, X))}
+        if seconds is not None:
+            row["fit_seconds"] = seconds[name]
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(SELECTION_METRIC, ascending=False).reset_index(drop=True)
+
+
+# Column layout of the reported evaluation tables, mapping our internal metric
+# names onto the conventional report names. "specificity" is recall on the
+# dissatisfied (negative) class; it is the same quantity as recall_dissat, named
+# the way the evaluation table convention expects.
+# Metric used to rank models, sort the CV table, pick the best model, and choose
+# the top-3 for permutation importance. Single source of truth so the project
+# cannot rank on one metric and report another.
+#
+# Gini on purpose. Gini = 2*ROC_AUC - 1 inherits ROC-AUC's invariance to the class
+# prior (no-skill = 0 at any imbalance), so it stays comparable across subsamples
+# and cannot be gamed by predicting the majority class. Accuracy is prior-corrupted
+# and is not computed at all; PR-AUC is prior-dependent and is reported, not ranked on.
+SELECTION_METRIC = "gini"
+SELECTION_METRIC_CV = f"{SELECTION_METRIC}_mean"
+
+# scikit-learn has no "gini" scorer string. Because gini is a strictly increasing
+# function of ROC-AUC, maximising roc_auc maximises gini exactly, so this is the
+# implementation of SELECTION_METRIC inside GridSearchCV / cross_validate /
+# permutation_importance. ROC-AUC never leaves this module as a reported number.
+GRID_SCORING = "roc_auc"
+
+# Reported table layout. Deliberately imbalance-aware:
+#   - Balanced accuracy replaces accuracy, which a 70/30 prior corrupts.
+#   - PR-AUC is the DISSATISFIED-class average precision (baseline 0.303), not the
+#     satisfied-class one (baseline 0.697, which flatters every model).
+#   - GINI carries the ROC-AUC information and is SELECTION_METRIC. Gini =
+#     2*ROC_AUC - 1 is a strictly increasing rescaling, so it ranks models
+#     identically and ROC-AUC is never reported anywhere. If a reader wants it,
+#     ROC_AUC = (GINI + 1) / 2 recovers it exactly.
+REPORT_COLUMNS = {
+    "model": "Model",
+    "balanced_accuracy": "Balanced Acc.",
+    "pr_auc_dissat": "PR-AUC",
+    "gini": "GINI",
+    "top_decile_lift": "TDL",
+    "precision": "Precision",
+    "recall": "Recall",
+    "f1": "F1",
+    "recall_dissat": "Specificity",
+    "fit_seconds": "Time (s)",
+}
+
+# Columns where a smaller value is better (used by the conditional formatting).
+REPORT_LOWER_IS_BETTER = {"Time (s)"}
+
+# Fixed row order and display names for the evaluation tables. The order is
+# deliberately NOT by score: the three tables (un-tuned/train, tuned/train,
+# tuned/test) must list models in the same sequence so a reader can compare one
+# model across tables by looking at the same row.
+MODEL_DISPLAY_ORDER = [
+    "logistic_regression",
+    "naive_bayes",
+    "knn",
+    "svm_linear",
+    "decision_tree",
+    "random_forest",
+    "bagging",
+    "hist_gradient_boosting",
+    "neural_net",
+]
+
+MODEL_DISPLAY_NAMES = {
+    "logistic_regression": "Logistic Regression",
+    "naive_bayes": "Naive Bayes",
+    "knn": "KNN",
+    "svm_linear": "SVM (Linear)",
+    "decision_tree": "Decision Tree",
+    "random_forest": "Random Forest",
+    "bagging": "Bagging",
+    "hist_gradient_boosting": "Gradient Boosting",
+    "neural_net": "Neural Network",
+}
+
+
+def to_report_table(results: pd.DataFrame) -> pd.DataFrame:
+    """Project a full metrics frame onto the reported evaluation-table layout,
+    in the fixed MODEL_DISPLAY_ORDER with human-readable model names."""
+    cols = [c for c in REPORT_COLUMNS if c in results.columns]
+    table = results[cols].rename(columns=REPORT_COLUMNS)
+    order = [m for m in MODEL_DISPLAY_ORDER if m in set(table["Model"])]
+    table = table.set_index("Model").loc[order].reset_index()
+    table["Model"] = table["Model"].map(MODEL_DISPLAY_NAMES).fillna(table["Model"])
+    return table
+
+
+def print_report_table(table: pd.DataFrame, title: str) -> None:
+    print("\n" + "=" * 100)
+    print(title)
+    print("=" * 100)
+    with pd.option_context("display.width", 200, "display.float_format", "{:.3f}".format):
+        print(table.to_string(index=False))
+
+
+# Conditional-formatting poles for the rendered tables. Teal (better) and amber
+# (worse), NOT red/green: simulated under deuteranopia, red/green separate by only
+# dE 10.4 (below the dE >= 12 legibility floor), while teal/amber hold dE 62.5.
+# Colour is redundant emphasis here -- every value is also printed in its cell.
+TABLE_GOOD_RGB = (0.059, 0.463, 0.431)   # #0f766e teal
+TABLE_BAD_RGB = (0.706, 0.325, 0.035)    # #b45309 amber
+TABLE_MAX_TINT = 0.42                    # keeps black text at >= 8:1 contrast
+
+
+def _cell_colour(series: pd.Series, value: float, lower_is_better: bool):
+    """Blend white toward the good/bad pole by the value's rank within its column."""
+    low, high = series.min(), series.max()
+    if high == low or pd.isna(value):
+        return (1.0, 1.0, 1.0)
+    t = (value - low) / (high - low)
+    if lower_is_better:
+        t = 1.0 - t
+    pole = TABLE_GOOD_RGB if t >= 0.5 else TABLE_BAD_RGB
+    weight = abs(t - 0.5) * 2 * TABLE_MAX_TINT
+    return tuple(1.0 - weight * (1.0 - c) for c in pole)
+
+
+def save_report_table_png(
+    table: pd.DataFrame, title: str, filename: str, degenerate_rows: tuple = (),
+) -> Path:
+    """Render an evaluation table as a conditional-formatted PNG for the report.
+
+    `degenerate_rows` names models whose values are artefacts rather than results
+    (KNN scored on its own training set); they are greyed out and excluded from
+    the colour scale so they cannot distort it.
+    """
+    metrics = [c for c in table.columns if c != "Model"]
+    live = table[~table["Model"].isin(degenerate_rows)]
+
+    text = [
+        [row["Model"]] + [
+            f"{row[c]:.1f}" if c in REPORT_LOWER_IS_BETTER else f"{row[c]:.3f}"
+            for c in metrics
+        ]
+        for _, row in table.iterrows()
+    ]
+
+    # Explicit column widths. Matplotlib's default equal widths clip both the long
+    # model names and the wider headers ("Balanced Acc.", "Specificity"), so each
+    # column is sized from its widest text rather than shared out evenly.
+    model_w = 0.11 * max(len(str(v)) for v in table["Model"]) + 0.55
+    metric_w = [max(0.95, 0.082 * len(c) + 0.36) for c in metrics]
+    total_w = model_w + sum(metric_w)
+    col_widths = [model_w / total_w] + [w / total_w for w in metric_w]
+
+    n_rows = len(table) + 1                       # + header
+    fig, ax = plt.subplots(figsize=(total_w, 0.34 * n_rows + 0.55))
+    ax.axis("off")
+    ax.set_title(title, loc="left", fontsize=12, fontweight="bold", pad=10)
+
+    mpl_table = ax.table(
+        cellText=text,
+        colLabels=["Model"] + metrics,
+        cellLoc="right",
+        colWidths=col_widths,
+        bbox=[0, 0, 1, 1],                        # fill the axes; no dead space
+    )
+    mpl_table.auto_set_font_size(False)
+    mpl_table.set_fontsize(9)
+
+    for (r, c), cell in mpl_table.get_celld().items():
+        cell.set_edgecolor("#d8dde2")
+        cell.set_linewidth(0.5)
+        if r == 0:                                     # header
+            cell.set_facecolor("#eef2f6")
+            cell.set_text_props(fontweight="bold", color="#3d454d")
+            if c == 0:
+                cell.set_text_props(ha="left")
+            continue
+        model = table.iloc[r - 1]["Model"]
+        if c == 0:                                     # model name column
+            cell.set_text_props(ha="left", fontweight="medium")
+            cell.set_facecolor("#ffffff")
+            continue
+        if model in degenerate_rows:
+            cell.set_facecolor("#f4f5f6")
+            cell.set_text_props(color="#9aa2ab", style="italic")
+            continue
+        column = metrics[c - 1]
+        cell.set_facecolor(_cell_colour(
+            live[column], table.iloc[r - 1][column], column in REPORT_LOWER_IS_BETTER
+        ))
+
+    path = PLOT_DIR / filename
+    fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  saved {path}")
+    return path
+
+
+def evaluate_holdout(
+    models, X_train, X_test, y_train, y_test
+) -> tuple[pd.DataFrame, dict, pd.DataFrame, dict]:
+    """Fit each model on train; return full metric tables for both the held-out
+    test set and the training set.
+
+    Returns (test_results, fitted, train_results, fit_seconds).
+    """
+    fitted, seconds = fit_and_time(models, X_train, y_train)
+    test_results = evaluate_fitted(fitted, X_test, y_test, seconds)
+    train_results = evaluate_fitted(fitted, X_train, y_train, seconds)
+    return test_results, fitted, train_results, seconds
 
 
 def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
-    """Optional light stratified CV on a subsample, for stability estimates."""
+    """Light stratified CV on a training subsample, for stability estimates.
+
+    Called *after* the grid search so the reported mean +/- std describe the
+    tuned models. This is a reporting step, not a selection step: the winning
+    hyperparameters were already chosen inside GridSearchCV's own folds.
+    """
     if len(X_train) > CV_SUBSAMPLE:
         Xs = X_train.sample(CV_SUBSAMPLE, random_state=RANDOM_STATE)
         ys = y_train.loc[Xs.index]
@@ -3906,7 +4464,9 @@ def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
         Xs, ys = X_train, y_train
 
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    scoring = ["accuracy", "balanced_accuracy", "f1", "roc_auc", "average_precision"]
+    # No "accuracy" (prior-corrupted) and no "average_precision" (that is the
+    # satisfied-class PR-AUC, whose no-skill floor is the 0.697 positive rate).
+    scoring = ["balanced_accuracy", "f1", GRID_SCORING]
 
     rows = []
     for name, model in models.items():
@@ -3915,11 +4475,17 @@ def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
         row = {"model": name, "cv_rows": len(Xs)}
         for metric in scoring:
             values = scores[f"test_{metric}"]
-            row[f"{metric}_mean"] = values.mean()
-            row[f"{metric}_std"] = values.std()
+            if metric == GRID_SCORING:
+                # Report gini, not roc_auc. gini = 2*auc - 1 is affine, so the mean
+                # maps directly and the standard deviation scales by 2.
+                row[f"{SELECTION_METRIC}_mean"] = 2 * values.mean() - 1
+                row[f"{SELECTION_METRIC}_std"] = 2 * values.std()
+            else:
+                row[f"{metric}_mean"] = values.mean()
+                row[f"{metric}_std"] = values.std()
         rows.append(row)
 
-    return pd.DataFrame(rows).sort_values("roc_auc_mean", ascending=False).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(SELECTION_METRIC_CV, ascending=False).reset_index(drop=True)
 
 
 def plot_confusion(model, X_test, y_test, name: str) -> None:
@@ -3934,37 +4500,287 @@ def plot_confusion(model, X_test, y_test, name: str) -> None:
     print(f"  saved {path}")
 
 
-def run_grid_search(X_train, y_train) -> None:
-    """Focused hyperparameter search on the two strongest models (HGB + random
-    forest), on a subsample for speed. Prints best CV ROC-AUC and parameters."""
-    print_section("Hyperparameter search (top models, ROC-AUC, CV)")
+def find_boundary_hits(grid: dict, best_params: dict) -> list[str]:
+    """Report tuned values that landed on the edge of their search range.
+
+    A winner at the minimum or maximum of a numeric axis means the search was
+    cut off: the true optimum may lie outside the grid, so the reported value is
+    partly an artefact of the range we happened to choose. The fix is to widen
+    that axis and re-run.
+
+    Only ordered numeric axes are checked. Categorical axes ("gini"/"entropy",
+    "sqrt", layer-size tuples) have no meaningful boundary.
+    """
+    hits = []
+    for key, values in grid.items():
+        if len(values) < 2:
+            continue
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+            continue
+        chosen = best_params.get(key)
+        short = key.split("__")[-1]
+        if chosen == min(values):
+            hits.append(f"{short}={chosen} (grid minimum)")
+        elif chosen == max(values):
+            hits.append(f"{short}={chosen} (grid maximum)")
+    return hits
+
+
+# Hyperparameters deliberately held FIXED rather than searched. Reported next to
+# the tuned ones so the paper can state each model's full specification, and so a
+# reader can see that e.g. class_weight was a design decision, not a search result.
+FIXED_HYPERPARAMETERS: dict[str, dict] = {
+    "logistic_regression": {
+        "solver": "lbfgs", "penalty": "l2 (lbfgs supports no other)",
+        "max_iter": 1000, "class_weight": "balanced",
+    },
+    "svm_linear": {
+        "dual": False, "loss": "squared_hinge (forced by dual=False)",
+        "max_iter": 5000, "class_weight": "balanced",
+    },
+    "knn": {
+        "weights": "uniform (distance weighting makes the training score a degenerate 1.000)",
+        "metric": "minkowski (p=2, Euclidean)", "algorithm": "auto",
+    },
+    "naive_bayes": {
+        "likelihood": "Bernoulli over indicators (no parametric density assumed)",
+        "binning strategy": "quantile (invariant to monotone transforms)",
+        "class_weight": "not supported by BernoulliNB",
+    },
+    "neural_net": {
+        "activation": "relu", "solver": "adam", "early_stopping": True,
+        "max_iter": 100, "class_weight": "not supported by MLPClassifier",
+    },
+    "decision_tree": {"splitter": "best", "class_weight": "balanced"},
+    "bagging": {
+        "n_estimators": "50 (fixed: more trees is monotonically non-worse)",
+        "estimator": "DecisionTreeClassifier", "class_weight": "balanced (set on the base tree)",
+    },
+    "random_forest": {
+        "n_estimators": "200 (fixed: more trees is monotonically non-worse)",
+        "class_weight": "balanced",
+    },
+    "hist_gradient_boosting": {
+        "max_iter": "500 (a cap; early stopping picks the iteration count)",
+        "early_stopping": True, "validation_fraction": 0.1, "n_iter_no_change": 10,
+        "class_weight": "balanced",
+    },
+}
+
+
+def _fmt_value(value) -> str:
+    """Compact, readable rendering of a single hyperparameter value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    return f"{value:g}"
+
+
+def format_search_space(values: list) -> str:
+    """Render a grid axis the way a methods table should read.
+
+    Detects arithmetic and geometric progressions so a long axis collapses to
+    "0.0001 to 1 (x10)" instead of spelling out every value.
+    """
+    if len(values) == 1:
+        return _fmt_value(values[0])
+
+    numeric = all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) for v in values
+    )
+    if numeric and len(values) >= 3:
+        ordered = sorted(values)
+        steps = [b - a for a, b in zip(ordered, ordered[1:])]
+        if max(steps) - min(steps) < 1e-12:
+            return f"{_fmt_value(ordered[0])} to {_fmt_value(ordered[-1])} (step {_fmt_value(steps[0])})"
+        if all(v > 0 for v in ordered):
+            ratios = [b / a for a, b in zip(ordered, ordered[1:])]
+            if max(ratios) - min(ratios) < 1e-9:
+                return f"{_fmt_value(ordered[0])} to {_fmt_value(ordered[-1])} (x{_fmt_value(ratios[0])})"
+
+    return ", ".join(_fmt_value(v) for v in values)
+
+
+def _edge_note(values: list, chosen) -> str:
+    """Flag a winner sitting on the edge of an ordered numeric axis."""
+    if len(values) < 2:
+        return ""
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
+        return ""
+    if chosen == min(values):
+        return "<- grid minimum"
+    if chosen == max(values):
+        return "<- grid maximum"
+    return ""
+
+
+def print_hyperparameter_table(best_params: dict[str, dict]) -> pd.DataFrame:
+    """Print (and return) the methods-section hyperparameter table.
+
+    One row per hyperparameter: what was searched, over what space, and what won.
+    Fixed hyperparameters are listed too, because "we did not tune this, and here
+    is the value we used" is part of the model specification a reader needs.
+    """
+    print_section("Hyperparameter tuning summary")
+
+    rows = []
+    for key in MODEL_DISPLAY_ORDER:
+        display = MODEL_DISPLAY_NAMES.get(key, key)
+        first = True
+
+        for param, values in PARAM_GRIDS.get(key, {}).items():
+            chosen = best_params.get(key, {}).get(param)
+            rows.append({
+                "Model": display if first else "",
+                "Hyperparameter": param.split("__", 1)[-1],
+                "Search Space Tested": format_search_space(values),
+                "Optimal Value": _fmt_value(chosen) if chosen is not None else "not searched",
+                "Note": _edge_note(values, chosen) if chosen is not None else "",
+            })
+            first = False
+
+        for param, value in FIXED_HYPERPARAMETERS.get(key, {}).items():
+            rows.append({
+                "Model": display if first else "",
+                "Hyperparameter": param,
+                "Search Space Tested": "fixed (not searched)",
+                "Optimal Value": _fmt_value(value),
+                "Note": "",
+            })
+            first = False
+
+    table = pd.DataFrame(rows)
+    widths = {c: max(len(c), table[c].str.len().max()) for c in table.columns}
+    header = "  ".join(c.ljust(widths[c]) for c in table.columns).rstrip()
+    print(header)
+    print("-" * len(header))
+    previous_model = None
+    for _, row in table.iterrows():
+        if row["Model"] and previous_model is not None:
+            print("-" * len(header))
+        if row["Model"]:
+            previous_model = row["Model"]
+        print("  ".join(str(row[c]).ljust(widths[c]) for c in table.columns).rstrip())
+
+    edges = int((table["Note"] != "").sum())
+    searched = int((table["Search Space Tested"] != "fixed (not searched)").sum())
+    print(
+        f"\n{searched} hyperparameters searched across {len(PARAM_GRIDS)} models; "
+        f"{edges} winner(s) landed on a grid edge."
+    )
+    if edges:
+        print("A winner on a grid edge means the search was cut off: the optimum may")
+        print("lie outside the range, so that value is partly an artefact of the grid.")
+
+    path = OUTPUT_DIR / "hyperparameter_tuning_table.csv"
+    table.to_csv(path, index=False)
+    print(f"\nSaved: {path}")
+    return table
+
+
+def run_grid_search(X_train, y_train) -> dict[str, dict]:
+    """Hyperparameter search over every tunable model, on the training set only.
+
+    Each model's grid (PARAM_GRIDS) is searched with GridSearchCV, scored by
+    ROC-AUC. The inner StratifiedKFold folds do the validating, so the test set
+    is never touched here.
+
+    Runs on a subsample (GRID_SAMPLE) for tractability. We therefore return the
+    winning *parameters* rather than search.best_estimator_, because that
+    estimator is fit on the subsample only; the caller re-fits the tuned
+    pipelines on the full training set.
+
+    Returns {model_name: best_params}, empty for models with no grid.
+    """
+    print_section("Hyperparameter search (all tunable models, ROC-AUC, CV)")
 
     if len(X_train) > GRID_SAMPLE:
         Xs = X_train.sample(GRID_SAMPLE, random_state=RANDOM_STATE)
         ys = y_train.loc[Xs.index]
     else:
         Xs, ys = X_train, y_train
-    print(f"Searching on {len(Xs):,} rows, {CV_FOLDS}-fold CV.")
 
     pipes = build_models(Xs)
     grids = {
-        "hist_gradient_boosting": {
-            "model__learning_rate": [0.05, 0.1],
-            "model__max_leaf_nodes": [31, 63],
-            "model__max_iter": [100, 200],
-        },
-        "random_forest": {
-            "model__max_depth": [12, 16, 20],
-            "model__min_samples_leaf": [20, 50],
-        },
+        name: grid
+        for name, grid in PARAM_GRIDS.items()
+        if grid and name in pipes
     }
+    n_configs = sum(
+        int(np.prod([len(v) for v in grid.values()])) for grid in grids.values()
+    )
+    print(f"Searching on {len(Xs):,} rows, {CV_FOLDS}-fold CV.")
+    print(f"{len(grids)} models, {n_configs} configurations, "
+          f"{n_configs * CV_FOLDS} fits.")
+
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+    best_params: dict[str, dict] = {}
+    rows = []
+    all_hits: dict[str, list[str]] = {}
     for name, grid in grids.items():
         print(f"\nSearching {name} ...")
-        search = GridSearchCV(pipes[name], grid, scoring="roc_auc", cv=cv, n_jobs=-1)
+        search = GridSearchCV(pipes[name], grid, scoring=GRID_SCORING, cv=cv, n_jobs=-1)
         search.fit(Xs, ys)
-        print(f"  best CV ROC-AUC: {search.best_score_:.4f}")
-        print(f"  best params:     {search.best_params_}")
+        best_params[name] = search.best_params_
+        best_gini = 2 * search.best_score_ - 1     # scorer maximises AUC == maximises gini
+        print(f"  best CV GINI: {best_gini:.4f}")
+        print(f"  best params:  {search.best_params_}")
+
+        hits = find_boundary_hits(grid, search.best_params_)
+        if hits:
+            all_hits[name] = hits
+            print(f"  WARNING boundary hit: {'; '.join(hits)}")
+
+        rows.append({
+            "model": name,
+            "best_cv_gini": best_gini,
+            "search_rows": len(Xs),
+            "cv_folds": CV_FOLDS,
+            "n_configurations": int(np.prod([len(v) for v in grid.values()])),
+            "best_params": str(search.best_params_),
+            "boundary_hits": "; ".join(hits),
+        })
+
+    if not all_hits:
+        print("\nNo boundary hits: every tuned value is interior to its grid.")
+
+    # Exported so the chosen hyperparameters can go straight into the appendix.
+    tuned = pd.DataFrame(rows).sort_values("best_cv_gini", ascending=False)
+    path = OUTPUT_DIR / "hyperparameter_search.csv"
+    tuned.to_csv(path, index=False)
+    print(f"\nSaved: {path}")
+
+    # The methods-section table: every hyperparameter, its search space, and the
+    # winning value, with fixed (unsearched) parameters listed alongside.
+    print_hyperparameter_table(best_params)
+
+    return best_params
+
+
+def apply_best_params(models: dict, best_params: dict[str, dict]) -> dict:
+    """Overwrite each pipeline's hyperparameters with the tuned values.
+
+    The pipelines were built on the full training set, so setting parameters here
+    (rather than reusing GridSearchCV's best_estimator_, which saw only the
+    search subsample) means the final models are re-fit on all training rows.
+    Models without tuned parameters keep their build_models() defaults.
+    """
+    if not best_params:
+        return models
+
+    print_subsection("Applying tuned hyperparameters")
+    for name, params in best_params.items():
+        if name in models and params:
+            models[name].set_params(**params)
+            pretty = ", ".join(
+                f"{key.split('__')[-1]}={value}" for key, value in sorted(params.items())
+            )
+            print(f"  {name}: {pretty}")
+
+    untuned = sorted(set(models) - set(best_params))
+    if untuned:
+        print(f"  (defaults kept for: {', '.join(untuned)})")
+    return models
 
 
 def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
@@ -3977,8 +4793,7 @@ def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
     """
     print_section("Permutation feature importance (top 3 models)")
 
-    model_names = [m for m in top_models
-                   if m in fitted and m != "baseline_most_frequent"][:3]
+    model_names = [m for m in top_models if m in fitted][:3]
 
     if len(X_test) > PERM_SAMPLE:
         Xp = X_test.sample(PERM_SAMPLE, random_state=RANDOM_STATE)
@@ -3992,7 +4807,7 @@ def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
     for name in model_names:
         print(f"  importance: {name} ...")
         result = permutation_importance(
-            fitted[name], Xp, yp, scoring="roc_auc",
+            fitted[name], Xp, yp, scoring=GRID_SCORING,
             n_repeats=PERM_REPEATS, random_state=RANDOM_STATE, n_jobs=-1,
         )
         importances[name] = pd.Series(result.importances_mean, index=Xp.columns).clip(lower=0)
@@ -4022,13 +4837,532 @@ def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Top-k feature-subset curve
+# ---------------------------------------------------------------------------
+
+def cv_permutation_importance(model, X_train, y_train) -> pd.Series:
+    """Fold-averaged permutation importance, measured on held-out training folds.
+
+    For each stratified fold: fit a fresh clone on the in-fold rows, then permute
+    each feature on the OUT-OF-FOLD rows and record the drop in score. Averaging
+    across folds gives a ranking that never saw the test set, so it is safe to
+    select features with.
+
+    Returned in Gini units (the project's SELECTION_METRIC). permutation_importance
+    scores with roc_auc, and gini = 2*auc - 1 is affine, so a drop of d in AUC is a
+    drop of 2d in Gini.
+    """
+    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    per_fold = []
+
+    for fold, (in_fold, out_fold) in enumerate(cv.split(X_train, y_train), start=1):
+        X_in, y_in = X_train.iloc[in_fold], y_train.iloc[in_fold]
+        X_out, y_out = X_train.iloc[out_fold], y_train.iloc[out_fold]
+
+        estimator = clone(model).fit(X_in, y_in)
+
+        if len(X_out) > TOPK_PERM_SAMPLE:
+            X_out = X_out.sample(TOPK_PERM_SAMPLE, random_state=RANDOM_STATE)
+            y_out = y_out.loc[X_out.index]
+
+        print(f"  fold {fold}/{CV_FOLDS}: permuting {X_train.shape[1]} features "
+              f"on {len(X_out):,} held-out rows ...")
+        result = permutation_importance(
+            estimator, X_out, y_out, scoring=GRID_SCORING,
+            n_repeats=TOPK_PERM_REPEATS, random_state=RANDOM_STATE, n_jobs=-1,
+        )
+        per_fold.append(pd.Series(2 * result.importances_mean, index=X_train.columns))
+
+    return pd.concat(per_fold, axis=1).mean(axis=1).sort_values(ascending=False)
+
+
+def paired_bootstrap_gini(
+    y_true, scores_by_key: dict, reference_key, key_name: str = "n_features",
+) -> pd.DataFrame:
+    """Percentile CIs for each variant's Gini and for its difference from a reference.
+
+    The bootstrap is PAIRED: one resample of test rows is drawn, and every variant is
+    rescored on those same rows. Because the variants' errors are correlated, the
+    difference between two of them is pinned down far more tightly than either Gini
+    is on its own -- an unpaired standard error would badly overstate the uncertainty
+    of the comparison, and would wrongly declare real differences insignificant.
+
+    Used by both the top-k curve (reference = the full-feature model) and the
+    feature-group ablation (reference = the model with every group present).
+    """
+    rng = np.random.default_rng(RANDOM_STATE)
+    y = np.asarray(y_true)
+    n = len(y)
+    keys = list(scores_by_key)
+
+    levels = {k: [] for k in keys}
+    deltas = {k: [] for k in keys}
+    for _ in range(TOPK_BOOTSTRAP):
+        idx = rng.integers(0, n, n)
+        y_b = y[idx]
+        if y_b.min() == y_b.max():      # degenerate resample, no positive/negative
+            continue
+        gini_b = {k: 2 * roc_auc_score(y_b, scores_by_key[k][idx]) - 1 for k in keys}
+        for k in keys:
+            levels[k].append(gini_b[k])
+            deltas[k].append(gini_b[k] - gini_b[reference_key])
+
+    # Every non-reference variant is compared against the reference, so we make
+    # (len(keys) - 1) simultaneous comparisons. Testing each at 95% inflates the
+    # family-wise error rate well above 5%. The Bonferroni interval below widens
+    # each one so that the FAMILY of comparisons jointly holds at 95%.
+    n_comparisons = max(len(keys) - 1, 1)
+    alpha = 0.05
+    bonf = 100 * alpha / (2 * n_comparisons)
+
+    rows = []
+    for k in keys:
+        lo, hi = np.percentile(levels[k], [2.5, 97.5])
+        d_lo, d_hi = np.percentile(deltas[k], [2.5, 97.5])
+        b_lo, b_hi = np.percentile(deltas[k], [bonf, 100 - bonf])
+        rows.append({
+            key_name: k,
+            "gini_lo": lo, "gini_hi": hi,
+            "delta_vs_full": np.mean(deltas[k]),
+            "delta_vs_full_lo": d_lo, "delta_vs_full_hi": d_hi,
+            "delta_bonf_lo": b_lo, "delta_bonf_hi": b_hi,
+            # "Significant" = the interval excludes zero.
+            "differs_from_full": bool(d_lo > 0 or d_hi < 0),
+            "differs_from_full_bonf": bool(b_lo > 0 or b_hi < 0),
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_topk_curve(curve: pd.DataFrame, model_name: str) -> Path:
+    """Test-set Gini as a function of feature-set size."""
+    full = curve.iloc[-1]
+    has_ci = "delta_vs_full_lo" in curve
+
+    # Two panels on purpose. The top shows the level, which is what a reader wants
+    # to see. The bottom shows the PAIRED difference from the full model, which is
+    # where the statistical claim actually lives. Plotting only the levels with
+    # their own error bars would be misleading: those intervals overlap heavily,
+    # tempting the reader to conclude "no difference", even though the paired
+    # difference is estimated far more precisely than either level.
+    fig, (ax, ax2) = plt.subplots(
+        2, 1, figsize=(9, 7), sharex=True, height_ratios=[2, 1.15],
+    )
+
+    ax.plot(curve["n_features"], curve["gini"], marker="o", linewidth=2, color="#0f766e")
+    ax.axhline(full["gini"], linestyle="--", linewidth=1, color="#8a939d")
+    ax.annotate(f"full model ({int(full['n_features'])} features)",
+                xy=(full["n_features"], full["gini"]), xytext=(-6, -16),
+                textcoords="offset points", ha="right", fontsize=8.5, color="#5b6570")
+    for _, row in curve.iterrows():
+        ax.annotate(f"{row['gini']:.3f}", xy=(row["n_features"], row["gini"]),
+                    xytext=(0, 9), textcoords="offset points", ha="center", fontsize=8)
+    ax.set_ylabel("Test-set GINI")
+    ax.set_title(f"Feature-subset curve - {model_name}", loc="left", fontweight="bold", pad=12)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linewidth=0.5, alpha=0.4)
+
+    if has_ci:
+        compare = curve.iloc[:-1]        # the full model is the reference, not a comparison
+        ax2.axhline(0, linewidth=1, color="#8a939d")
+        ax2.errorbar(
+            compare["n_features"], compare["delta_vs_full"],
+            yerr=[compare["delta_vs_full"] - compare["delta_vs_full_lo"],
+                  compare["delta_vs_full_hi"] - compare["delta_vs_full"]],
+            fmt="o", color="#0f766e", ecolor="#0f766e", elinewidth=1.4, capsize=4,
+            label="95% paired CI",
+        )
+        ax2.errorbar(
+            compare["n_features"], compare["delta_vs_full"],
+            yerr=[compare["delta_vs_full"] - compare["delta_bonf_lo"],
+                  compare["delta_bonf_hi"] - compare["delta_vs_full"]],
+            fmt="none", ecolor="#b45309", elinewidth=1, capsize=7, alpha=0.85,
+            label="Bonferroni-adjusted (family-wise 95%)",
+        )
+        ax2.set_ylabel("GINI vs full model")
+        ax2.legend(frameon=False, fontsize=8, loc="lower right")
+        ax2.spines[["top", "right"]].set_visible(False)
+        ax2.grid(axis="y", linewidth=0.5, alpha=0.4)
+
+    ax2.set_xlabel("Number of features (ranked by cross-validated permutation importance)")
+    fig.tight_layout()
+    path = PLOT_DIR / "topk_feature_curve.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+    return path
+
+
+def run_topk_curve(
+    model_name: str, best_params: dict, X_train, y_train, X_test, y_test,
+) -> pd.DataFrame:
+    """Refit `model_name` on its top-k most important features and score on test.
+
+    The ranking comes from cross-validated permutation importance on the TRAINING
+    set (cv_permutation_importance), so the test set plays no part in choosing
+    which features survive. Each subset is then scored once on the test set.
+
+    The pipeline is rebuilt from scratch for every subset via build_models(), so
+    the ColumnTransformer's numeric/categorical column lists match the reduced
+    frame -- reusing the full-feature pipeline would reference missing columns.
+    """
+    print_section(f"Top-k feature-subset curve ({model_name})")
+    print("Feature ranking: permutation importance on held-out training folds.")
+    print("The test set is used only to score each already-chosen subset.\n")
+
+    reference = build_models(X_train)[model_name]
+    if best_params.get(model_name):
+        reference.set_params(**best_params[model_name])
+
+    importance = cv_permutation_importance(reference, X_train, y_train)
+    importance.to_csv(OUTPUT_DIR / "topk_feature_ranking.csv", header=["gini_drop"])
+
+    rows = []
+    scores_by_k = {}
+    for k in TOPK_VALUES:
+        columns = list(X_train.columns) if k is None else list(importance.head(k).index)
+        estimator = build_models(X_train[columns])[model_name]
+        if best_params.get(model_name):
+            estimator.set_params(**best_params[model_name])
+
+        print(f"  refitting on {len(columns):>3} features ...")
+        estimator.fit(X_train[columns], y_train)
+        y_score = get_scores(estimator, X_test[columns])
+        scored = compute_metrics(y_test, estimator.predict(X_test[columns]), y_score)
+        scores_by_k[len(columns)] = np.asarray(y_score)
+        rows.append({
+            "n_features": len(columns),
+            "gini": scored["gini"],
+            "pr_auc_dissat": scored["pr_auc_dissat"],
+            "balanced_accuracy": scored["balanced_accuracy"],
+            "top_decile_lift_dissat": scored["top_decile_lift_dissat"],
+        })
+
+    curve = pd.DataFrame(rows).sort_values("n_features").reset_index(drop=True)
+    full_gini = curve.iloc[-1]["gini"]
+    curve["gini_pct_of_full"] = 100 * curve["gini"] / full_gini
+
+    print(f"\nPaired bootstrap ({TOPK_BOOTSTRAP:,} resamples of the test rows) ...")
+    full_key = max(scores_by_k)          # the full-feature model is the reference
+    ci = paired_bootstrap_gini(y_test, scores_by_k, reference_key=full_key)
+    curve = curve.merge(ci, on="n_features", how="left")
+
+    print("\n" + "=" * 110)
+    print(f"FEATURE-SUBSET CURVE ({model_name}, test set)")
+    print("=" * 110)
+    show = curve[[
+        "n_features", "gini", "gini_pct_of_full", "delta_vs_full",
+        "delta_vs_full_lo", "delta_vs_full_hi", "differs_from_full",
+        "delta_bonf_lo", "delta_bonf_hi", "differs_from_full_bonf",
+    ]]
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 220):
+        print(show.to_string(index=False))
+    print("\ndelta_vs_full is the PAIRED difference from the full model: both models are")
+    print("scored on the SAME resampled test rows, so their errors are correlated and the")
+    print("difference is estimated far more precisely than either Gini is on its own.")
+    print("differs_from_full is True when the 95% interval excludes zero. The _bonf columns")
+    print("widen each interval so that all comparisons jointly hold at 95% (Bonferroni);")
+    print("that is the column to quote, since the curve makes several comparisons at once.")
+
+    print("\nTop 10 features by cross-validated permutation importance:")
+    for rank, (name, drop) in enumerate(importance.head(10).items(), start=1):
+        print(f"  {rank:2d}. {name:34s} {drop:+.5f} Gini lost when shuffled")
+
+    curve.to_csv(OUTPUT_DIR / "topk_feature_curve.csv", index=False)
+    print(f"\nSaved: {OUTPUT_DIR / 'topk_feature_curve.csv'}")
+    plot_topk_curve(curve, model_name)
+    return curve
+
+
+# ---------------------------------------------------------------------------
+# Feature-group ablation
+# ---------------------------------------------------------------------------
+# REQUIREMENTS.md 17 asks, as subquestions, whether particular BLOCKS of features
+# add predictive value: engagement indicators (2), user characteristics (3),
+# review timing (4), external/weather data (5). Permutation importance cannot
+# answer these, because features inside a correlated block mask one another --
+# shuffle weather_prcp alone and is_rainy still carries the rain signal, so both
+# look unimportant while the block as a whole may matter.
+#
+# The ablation removes a whole block at once, refits, and measures the drop with
+# the same paired bootstrap the top-k curve uses.
+
+def _group_membership(column: str) -> str | None:
+    """Assign a modelling column to a feature block (None = ungrouped)."""
+    if column.startswith("weather_") or column in ("is_rainy", "is_snowy", "is_hot", "is_cold"):
+        return "external (weather)"
+    if column in ("log_photo_count", "log_tip_compliment_count"):
+        return "engagement (photos, tips)"
+    if column.startswith("user_") or column.startswith("log_user_"):
+        return "user characteristics"
+    if column in ("review_year", "review_month", "review_weekday"):
+        return "review timing"
+    # attributes.* plus the sub-dictionaries flattened out of them during
+    # ingestion (Ambience -> ambience_*, Parking -> parking_*, GoodForMeal ->
+    # meal_*), and is_open, which is a business-level status flag.
+    if (column.startswith("attributes.") or column.startswith("ambience_")
+            or column.startswith("parking_") or column.startswith("meal_")
+            or column == "is_open"):
+        return "business attributes"
+    if column.startswith("category_"):
+        return "restaurant categories"
+    if column.startswith("hours_"):
+        return "opening hours"
+    if column in ("state", "latitude", "longitude"):
+        return "location"
+    if column == "log_business_review_count":
+        return "business popularity"
+    return None
+
+
+def assert_all_features_grouped(columns) -> None:
+    """Every modelling column must belong to a block, or the ablation silently
+    never tests it. Called before the ablation runs."""
+    ungrouped = [c for c in columns if _group_membership(c) is None]
+    if ungrouped:
+        raise ValueError(
+            f"{len(ungrouped)} feature(s) belong to no ablation block and would "
+            f"never be tested: {ungrouped}. Extend _group_membership()."
+        )
+
+
+def build_feature_groups(columns) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for column in columns:
+        name = _group_membership(column)
+        if name:
+            groups.setdefault(name, []).append(column)
+    return groups
+
+
+def run_feature_group_ablation(
+    model_name: str, best_params: dict, X_train, y_train, X_test, y_test,
+) -> pd.DataFrame:
+    """Refit the model with each feature block removed; report the Gini it costs.
+
+    A block that can be deleted without a significant loss of Gini did not add
+    predictive value beyond the blocks that remain. Note the "beyond": these are
+    marginal contributions, so two blocks carrying the same information can each
+    look dispensable while their union is not.
+    """
+    print_section(f"Feature-group ablation ({model_name})")
+
+    assert_all_features_grouped(X_train.columns)
+    groups = build_feature_groups(X_train.columns)
+    print(f"{len(groups)} blocks covering all {X_train.shape[1]} features:")
+    for name, columns in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        print(f"  {name:28s} {len(columns):>3} features")
+
+    def fit_and_score(columns):
+        estimator = build_models(X_train[columns])[model_name]
+        if best_params.get(model_name):
+            estimator.set_params(**best_params[model_name])
+        estimator.fit(X_train[columns], y_train)
+        y_score = get_scores(estimator, X_test[columns])
+        return np.asarray(y_score), compute_metrics(
+            y_test, estimator.predict(X_test[columns]), y_score)
+
+    print("\n  fitting the full model (all blocks) ...")
+    scores_by_key = {}
+    rows = []
+    full_score, full_metrics = fit_and_score(list(X_train.columns))
+    scores_by_key["ALL BLOCKS"] = full_score
+    rows.append({"removed_block": "ALL BLOCKS", "n_features_removed": 0,
+                 "n_features_used": X_train.shape[1], "gini": full_metrics["gini"]})
+
+    for name, columns in groups.items():
+        remaining = [c for c in X_train.columns if c not in set(columns)]
+        print(f"  removing {name:28s} (-{len(columns):>2} features) ...")
+        score, metrics = fit_and_score(remaining)
+        scores_by_key[name] = score
+        rows.append({"removed_block": name, "n_features_removed": len(columns),
+                     "n_features_used": len(remaining), "gini": metrics["gini"]})
+
+    print(f"\nPaired bootstrap ({TOPK_BOOTSTRAP:,} resamples of the test rows) ...")
+    ci = paired_bootstrap_gini(
+        y_test, scores_by_key, reference_key="ALL BLOCKS", key_name="removed_block")
+    table = (
+        pd.DataFrame(rows)
+        .merge(ci, on="removed_block", how="left")
+        .sort_values("delta_vs_full")           # most damaging removal first
+        .reset_index(drop=True)
+    )
+    # A block "adds value" when removing it significantly LOWERS Gini.
+    table["block_adds_value"] = table["delta_bonf_hi"] < 0
+
+    print("\n" + "=" * 118)
+    print(f"FEATURE-GROUP ABLATION ({model_name}, test set)")
+    print("=" * 118)
+    show = table[[
+        "removed_block", "n_features_removed", "gini", "delta_vs_full",
+        "delta_vs_full_lo", "delta_vs_full_hi", "delta_bonf_lo", "delta_bonf_hi",
+        "block_adds_value",
+    ]]
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 220):
+        print(show.to_string(index=False))
+    print("\ndelta_vs_full = Gini(without the block) - Gini(all blocks). Negative means")
+    print("the block was carrying signal. block_adds_value uses the Bonferroni interval,")
+    print("so it holds jointly across all blocks tested.")
+    print("\nCaution: these are MARGINAL contributions. Two blocks encoding the same")
+    print("information can each look dispensable while removing both would not be.")
+
+    table.to_csv(OUTPUT_DIR / "feature_group_ablation.csv", index=False)
+    print(f"\nSaved: {OUTPUT_DIR / 'feature_group_ablation.csv'}")
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Learning curve
+# ---------------------------------------------------------------------------
+
+def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
+    """Test-set Gini as a function of TRAINING-SET SIZE, on the full dataset.
+
+    Only the models that scale cheaply are used: HistGradientBoosting (histogram
+    binning, linear in rows) and logistic regression. KNN, the linear SVM and the
+    MLP are excluded because they cannot be fitted at these sizes -- which is the
+    same reason the main comparison is capped at a 100k subsample.
+
+    One stratified test set is held out once and reused at every training size, so
+    the curve is not confounded by a moving evaluation target.
+    """
+    print_section("Learning curve (does more data help?)")
+
+    X_pool, X_lc_test, y_pool, y_lc_test = train_test_split(
+        X_full, y_full,
+        test_size=LEARNING_CURVE_TEST_SIZE,
+        stratify=y_full,
+        random_state=RANDOM_STATE + 1,      # its own split; a separate experiment
+    )
+    print(f"pool {len(X_pool):,} rows | fixed test {len(X_lc_test):,} rows "
+          f"| positive rate {y_full.mean():.4f}")
+    print("NOTE: this split is independent of the 100k model-comparison split, so")
+    print("its numbers are not directly comparable with the model-comparison tables.\n")
+
+    rows = []
+    for size in LEARNING_CURVE_SIZES:
+        if size > len(X_pool):
+            print(f"  skipping n={size:,} (pool has only {len(X_pool):,} rows)")
+            continue
+        X_s, y_s = stratified_subsample(X_pool, y_pool, size)
+        for name in LEARNING_CURVE_MODELS:
+            estimator = build_models(X_s)[name]
+            if best_params.get(name):
+                estimator.set_params(**best_params[name])
+            start = perf_counter()
+            estimator.fit(X_s, y_s)
+            seconds = perf_counter() - start
+            scored = compute_metrics(
+                y_lc_test, estimator.predict(X_lc_test), get_scores(estimator, X_lc_test))
+            print(f"  n={size:>9,}  {name:24s} gini {scored['gini']:.4f}  ({seconds:5.1f}s)")
+            rows.append({
+                "n_train": size, "model": name, "gini": scored["gini"],
+                "pr_auc_dissat": scored["pr_auc_dissat"],
+                "balanced_accuracy": scored["balanced_accuracy"],
+                "fit_seconds": seconds,
+            })
+
+    curve = pd.DataFrame(rows)
+
+    print("\n" + "=" * 90)
+    print("LEARNING CURVE (fixed held-out test set)")
+    print("=" * 90)
+    wide = curve.pivot(index="n_train", columns="model", values="gini")
+    with pd.option_context("display.float_format", "{:.4f}".format):
+        print(wide.to_string())
+    for name in wide.columns:
+        first, last = wide[name].iloc[0], wide[name].iloc[-1]
+        past_100k = wide[name].loc[wide.index >= 100_000]
+        print(f"\n{name}:")
+        print(f"  {wide.index[0]:,} -> {wide.index[-1]:,} rows: gini {first:.4f} -> {last:.4f} "
+              f"({last - first:+.4f})")
+        if len(past_100k) > 1:
+            print(f"  from 100,000 rows onward: {past_100k.iloc[0]:.4f} -> {past_100k.iloc[-1]:.4f} "
+                  f"({past_100k.iloc[-1] - past_100k.iloc[0]:+.4f})")
+
+    curve.to_csv(OUTPUT_DIR / "learning_curve.csv", index=False)
+    print(f"\nSaved: {OUTPUT_DIR / 'learning_curve.csv'}")
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    palette = {"hist_gradient_boosting": "#0f766e", "logistic_regression": "#b45309"}
+    for name, block in curve.groupby("model"):
+        ax.plot(block["n_train"], block["gini"], marker="o", linewidth=2,
+                label=name, color=palette.get(name))
+    ax.axvline(MODEL_SAMPLE_N * 0.8, linestyle="--", linewidth=1, color="#8a939d")
+    ax.annotate("model-comparison\ntraining size (80k)",
+                xy=(MODEL_SAMPLE_N * 0.8, ax.get_ylim()[0]), xytext=(6, 12),
+                textcoords="offset points", fontsize=8, color="#5b6570")
+    ax.set_xscale("log")
+    ax.set_xlabel("Training-set size (log scale)")
+    ax.set_ylabel("Test-set GINI (fixed 250k held-out set)")
+    ax.set_title("Learning curve - does more data help?", loc="left", fontweight="bold")
+    ax.legend(frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", linewidth=0.5, alpha=0.4)
+    fig.tight_layout()
+    path = PLOT_DIR / "learning_curve.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+    return curve
+
+
+# ---------------------------------------------------------------------------
+# Coefficient table (direction of effect)
+# ---------------------------------------------------------------------------
+
+def export_logistic_coefficients(fitted_logit, top_n: int = 20) -> pd.DataFrame:
+    """Signed coefficients and odds ratios for the tuned logistic regression.
+
+    Permutation importance is unsigned: it says a feature matters, never whether
+    it is associated with higher or lower satisfaction. Managerial recommendations
+    need the sign, so it comes from here.
+
+    Numeric features are standardised inside the pipeline, so a coefficient is the
+    log-odds change per one standard deviation. Categorical features are one-hot
+    encoded without a dropped reference level, so their coefficients are relative
+    to the (L2-shrunk) average level, not to a baseline category -- read them
+    against each other, not in absolute terms.
+    """
+    print_section("Logistic regression coefficients (direction of effect)")
+
+    preprocessor = fitted_logit.named_steps["pre"]
+    estimator = fitted_logit.named_steps["model"]
+    names = preprocessor.get_feature_names_out()
+    coefficients = estimator.coef_[0]
+
+    table = pd.DataFrame({
+        "feature": names,
+        "coefficient": coefficients,
+        "odds_ratio": np.exp(coefficients),
+        "abs_coefficient": np.abs(coefficients),
+    }).sort_values("abs_coefficient", ascending=False).reset_index(drop=True)
+
+    print(f"{len(table)} encoded features. Odds ratio > 1 = associated with higher")
+    print("satisfaction; < 1 = associated with lower satisfaction. Numeric effects")
+    print("are per standard deviation.\n")
+    header = f"{'feature':<52} {'coef':>9} {'odds ratio':>11}"
+    print(header)
+    print("-" * len(header))
+    for _, row in table.head(top_n).iterrows():
+        print(f"{row['feature']:<52} {row['coefficient']:>+9.4f} {row['odds_ratio']:>11.4f}")
+
+    path = OUTPUT_DIR / "coefficients_logistic_regression.csv"
+    table.drop(columns="abs_coefficient").to_csv(path, index=False)
+    print(f"\nSaved: {path}")
+    return table
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def models_main(df: pd.DataFrame) -> None:
     print("Building feature set...")
-    X, y = select_features(df)
+    X_full, y_full = select_features(df)
 
+    # The learning curve needs the whole dataset, so keep a reference before the
+    # model-comparison subsample replaces X.
+    X, y = X_full, y_full
     X, y = stratified_subsample(X, y, MODEL_SAMPLE_N)
     if MODEL_SAMPLE_N is not None:
         print(f"Using a stratified subsample of {len(X):,} rows for the model comparison.")
@@ -4037,52 +5371,155 @@ def models_main(df: pd.DataFrame) -> None:
     print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows "
           f"| positive rate {y.mean() * 100:.2f}%")
 
+    # No-information reference. There is no DummyClassifier row in the comparison
+    # table, so state explicitly what a model with no skill scores on each reported
+    # metric. This is the class-imbalance check REQUIREMENTS.md 14 asks for.
+    # PR-AUC's floor is the DISSATISFIED rate, because that is the class it scores.
+    print(f"No-information reference (always predict 'satisfied'): "
+          f"Balanced Acc. 0.5000, GINI 0.0000, PR-AUC {1 - y.mean():.4f}, TDL 1.0000.")
+    print(f"Positive (satisfied) rate {y.mean():.4f}. Plain accuracy is not reported: "
+          f"a no-skill rule would score {y.mean():.4f} on it.")
+
     models = build_models(X_train)
 
+    # ---- Un-tuned reference pass, on the training set only. ----
+    # Fits the build_models() defaults so the report can show what tuning was
+    # actually worth. It never touches the test set: the point of comparison is
+    # tuned-vs-untuned on identical training data.
+    untuned_test = None
+    if DO_UNTUNED_COMPARISON:
+        print("\nFitting the UN-TUNED (default) models for the tuning comparison...")
+        untuned_fitted, untuned_seconds = fit_and_time(build_models(X_train), X_train, y_train)
+
+        untuned_train = evaluate_fitted(untuned_fitted, X_train, y_train, untuned_seconds)
+        untuned_table = to_report_table(untuned_train)
+        print_report_table(untuned_table, "EVALUATION: UN-TUNED MODELS on TRAINING data")
+        untuned_train.to_csv(OUTPUT_DIR / "eval_untuned_train_full.csv", index=False)
+        untuned_table.to_csv(OUTPUT_DIR / "eval_untuned_train.csv", index=False)
+        save_report_table_png(
+            untuned_table, "Un-tuned models - training data", "eval_untuned_train.png",
+        )
+
+        # Un-tuned models on the TEST set. Without this the effect of tuning cannot
+        # be measured at all: comparing the two TRAINING tables is misleading,
+        # because tuning selects stronger regularisation and therefore *lowers*
+        # training-set scores by design. Only held-out data shows what it bought.
+        untuned_test = evaluate_fitted(untuned_fitted, X_test, y_test, untuned_seconds)
+        untuned_test_table = to_report_table(untuned_test)
+        print_report_table(untuned_test_table, "EVALUATION: UN-TUNED MODELS on HELD-OUT TEST data")
+        untuned_test.to_csv(OUTPUT_DIR / "eval_untuned_test_full.csv", index=False)
+        untuned_test_table.to_csv(OUTPUT_DIR / "eval_untuned_test.csv", index=False)
+        save_report_table_png(
+            untuned_test_table, "Un-tuned models - held-out test data", "eval_untuned_test.png",
+        )
+        del untuned_fitted   # free the duplicate ensembles before refitting tuned
+
     # ---- Training-phase work first: nothing here touches the test set. ----
+    # Order is deliberate: tune -> cross-validate -> test.
+    #   1. Grid search picks each model's hyperparameters using inner CV folds on
+    #      the training set. Those folds ARE the validation step; no separate
+    #      validation split is needed.
+    #   2. Cross-validation then reports fold-to-fold stability (mean +/- std) of
+    #      the *tuned* models, which is what the paper actually reports. Running
+    #      it before tuning would describe models we never use.
+    #   3. Only afterwards is the held-out test set opened, exactly once.
+    # Defined up-front: the stages below are individually toggleable, and the
+    # top-k curve consumes both. With their stage off, an empty dict means "no
+    # tuned parameters" (models keep build_models defaults) and cv_results stays
+    # None, which run_topk_curve's caller handles explicitly.
+    best_params: dict[str, dict] = {}
+    cv_results = None
+
+    if DO_GRID_SEARCH:
+        best_params = run_grid_search(X_train, y_train)
+        models = apply_best_params(models, best_params)
+
     if DO_CV:
-        print("\nRunning light cross-validation (training subsample)...")
+        print("\nRunning light cross-validation on the tuned models (training subsample)...")
         cv_results = run_cross_validation(models, X_train, y_train)
         print("\n" + "=" * 100)
-        print(f"CROSS-VALIDATION ({CV_FOLDS}-fold, training subsample)")
+        print(f"CROSS-VALIDATION ({CV_FOLDS}-fold, training subsample, tuned models)")
         print("=" * 100)
         with pd.option_context("display.width", 200, "display.float_format", "{:.4f}".format):
             print(cv_results.to_string(index=False))
         cv_results.to_csv(OUTPUT_DIR / "model_comparison_cv.csv", index=False)
 
-    if DO_GRID_SEARCH:
-        run_grid_search(X_train, y_train)
-
     # ---- Fit on train; report training-set performance. ----
-    print("\nFitting models and evaluating on training and held-out test sets...")
-    results, fitted, train_results = evaluate_holdout(models, X_train, X_test, y_train, y_test)
+    print("\nFitting the TUNED models and evaluating on training and held-out test sets...")
+    results, fitted, train_results, _ = evaluate_holdout(models, X_train, X_test, y_train, y_test)
 
-    print("\n" + "=" * 100)
-    print("MODEL COMPARISON (training set)")
-    print("=" * 100)
-    with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
-        print(train_results.to_string(index=False))
+    # No degenerate rows: KNN is pinned to weights="uniform", so no model can
+    # reproduce its own training set by construction. save_report_table_png still
+    # accepts degenerate_rows in case a future model needs it.
+    tuned_train_table = to_report_table(train_results)
+    print_report_table(tuned_train_table, "EVALUATION: TUNED MODELS on TRAINING data")
     train_results.to_csv(OUTPUT_DIR / "model_comparison_train.csv", index=False)
-    print(f"Saved: {OUTPUT_DIR / 'model_comparison_train.csv'}")
+    tuned_train_table.to_csv(OUTPUT_DIR / "eval_tuned_train.csv", index=False)
+    save_report_table_png(
+        tuned_train_table, "Tuned models - training data", "eval_tuned_train.png",
+    )
 
     # ---- Held-out test set: the final measurement, touched last. ----
-    print("\n" + "=" * 100)
-    print("MODEL COMPARISON (held-out test set)")
-    print("=" * 100)
-    with pd.option_context("display.width", 250, "display.float_format", "{:.4f}".format):
-        print(results.to_string(index=False))
+    tuned_test_table = to_report_table(results)
+    print_report_table(tuned_test_table, "EVALUATION: TUNED MODELS on HELD-OUT TEST data")
     print("\nCompare against the training table above: scores far higher on train")
     print("than test = overfitting; both low and similar = underfitting.")
+    print("Note: Time is the training fit time, so it is identical in both tuned tables.")
     results.to_csv(OUTPUT_DIR / "model_comparison_holdout.csv", index=False)
-    print(f"Saved: {OUTPUT_DIR / 'model_comparison_holdout.csv'}")
+    tuned_test_table.to_csv(OUTPUT_DIR / "eval_tuned_test.csv", index=False)
+    save_report_table_png(
+        tuned_test_table, "Tuned models - held-out test data", "eval_tuned_test.png",
+    )
 
     # ---- Interpretation of the final model(s) on the test set. ----
     best_name = results.iloc[0]["model"]
-    print(f"\nBest model by ROC-AUC (baseline-proof): {best_name}")
+    # SELECTION_METRIC is GINI: invariant to the class prior (no-skill = 0), so a
+    # model that mostly predicts the majority class cannot win on it.
+    print(f"\nBest model by {SELECTION_METRIC.upper()} (invariant to class imbalance): {best_name}")
     plot_confusion(fitted[best_name], X_test, y_test, best_name)
+
+    # ---- What did tuning actually buy? Both tables are on the SAME test set. ----
+    if untuned_test is not None:
+        delta = (
+            results.set_index("model")["gini"] - untuned_test.set_index("model")["gini"]
+        ).sort_values(ascending=False)
+        print_subsection("Effect of hyperparameter tuning (test-set GINI, tuned - un-tuned)")
+        for name, change in delta.items():
+            print(f"  {name:24s} {change:+.4f}")
+        print(f"\n  mean {delta.mean():+.4f} | median {delta.median():+.4f} | "
+              f"improved {int((delta > 0).sum())}/{len(delta)} models")
 
     if DO_FEATURE_IMPORTANCE:
         plot_feature_importance(fitted, X_test, y_test, results["model"].head(3).tolist())
+
+    # Direction of effect. Permutation importance is unsigned, so the managerial
+    # section needs signed coefficients from the (interpretable) linear model.
+    if "logistic_regression" in fitted:
+        export_logistic_coefficients(fitted["logistic_regression"])
+
+    if DO_TOPK_CURVE:
+        # Pick the model for the curve from CROSS-VALIDATION, not from the test
+        # table. Selecting it by test performance and then reporting test-set
+        # curves for it would let the test set choose the model as well as score
+        # it. cv_results is computed on the training set only.
+        if DO_CV:
+            topk_model = cv_results.iloc[0]["model"]
+            print(f"\nCurve model chosen by cross-validated {SELECTION_METRIC}: {topk_model}")
+        else:
+            topk_model = results.iloc[0]["model"]
+            print(f"\nWARNING: DO_CV is off, so the curve model ({topk_model}) was")
+            print("chosen using the test set. Enable DO_CV for a clean selection.")
+        run_topk_curve(topk_model, best_params, X_train, y_train, X_test, y_test)
+
+    if DO_GROUP_ABLATION:
+        # Same model as the curve, chosen from cross-validation rather than the
+        # test table, for the same reason.
+        ablation_model = cv_results.iloc[0]["model"] if DO_CV else results.iloc[0]["model"]
+        run_feature_group_ablation(
+            ablation_model, best_params, X_train, y_train, X_test, y_test)
+
+    if DO_LEARNING_CURVE:
+        run_learning_curve(X_full, y_full, best_params)
 
     print("\nModel comparison completed.")
 
@@ -4122,6 +5559,10 @@ def main() -> None:
             )
         print(f"Loading cached enriched dataset: {DATASET_PKL}")
         enriched = pd.read_pickle(DATASET_PKL)
+        # Caches built before the u'x'/'x' fix still carry the duplicate attribute
+        # levels. The normaliser is idempotent, so repairing them here is a no-op
+        # on a cache written by the current ingestion code.
+        enriched = normalize_attribute_levels(enriched)
 
     # Remove features we won't use at all (e.g. the weather_available missing-
     # indicator) before EDA, so they don't appear in the EDA tables either.
