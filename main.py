@@ -236,6 +236,20 @@ warnings.filterwarnings(
 _FALLBACK_PALETTES = {"Warm": "Set2", "Pastel1": "Pastel1"}
 
 
+def apply_simple_plot_style(ax) -> None:
+    """The house plot style: a plain box, no grid, ticks outward, no chart junk.
+
+    Kept deliberately unadorned so every figure in the report looks the same.
+    Titles are omitted from the figures themselves -- the caption names the plot.
+    """
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.8)
+        spine.set_color("black")
+    ax.grid(False)
+    ax.tick_params(direction="out", length=4, width=0.8, colors="black")
+
+
 def qualitative_palette(name: str, n_colors: int) -> list[str]:
     """Return n distinct hex colours from a named qualitative palette.
 
@@ -5046,31 +5060,16 @@ def plot_permutation_importance(
     palette = dict(zip(unique_blocks, qualitative_palette("Pastel1", len(unique_blocks))))
     colours = [palette[b] for b in blocks]
 
-    fig, ax = plt.subplots(figsize=(10, 0.42 * len(top) + 2.0))
-    ax.barh(range(len(top)), top.to_numpy(), color=colours, edgecolor="#5b6570", linewidth=0.4)
+    fig, ax = plt.subplots(figsize=(10, 0.45 * len(top) + 1.6))
+    ax.barh(range(len(top)), top.to_numpy(), color=colours)
     ax.set_yticks(range(len(top)))
-    ax.set_yticklabels(top.index, fontsize=9)
-    ax.axvline(0, linewidth=1, color="#8a939d")
+    ax.set_yticklabels(top.index)
 
-    for i, value in enumerate(top.to_numpy()):
-        offset = 3 if value >= 0 else -3
-        ax.annotate(f"{value:.4f}", xy=(value, i), xytext=(offset, 0),
-                    textcoords="offset points", va="center",
-                    ha="left" if value >= 0 else "right", fontsize=8, color="#3d454d")
-
-    ax.set_xlabel("Permutation importance: GINI lost when the feature is shuffled")
-    ax.set_title(
-        f"Top {len(top)} features - {model_name}\n"
-        "cross-validated permutation importance on held-out training folds",
-        loc="left", fontweight="bold", fontsize=11,
-    )
-    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[b], ec="#5b6570", lw=0.4)
-               for b in unique_blocks]
-    ax.legend(handles, unique_blocks, title="feature block", frameon=False,
-              fontsize=8, title_fontsize=8, loc="lower right")
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(axis="x", linewidth=0.5, alpha=0.4)
-    ax.margins(x=0.16)
+    ax.set_xlabel("Permutation importance (GINI lost when shuffled)")
+    ax.set_ylabel("Feature")
+    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[b]) for b in unique_blocks]
+    ax.legend(handles, unique_blocks, title="Feature block", loc="lower right")
+    apply_simple_plot_style(ax)
     fig.tight_layout()
 
     path = PLOT_DIR / "permutation_importance_top_features.png"
@@ -5083,68 +5082,40 @@ def plot_permutation_importance(
 def plot_importance_comparison(
     agreement: pd.DataFrame, model_names: list[str], top_n: int = TOPK_IMPORTANCE_PLOT_N,
 ) -> Path:
-    """Side-by-side permutation importance for the statistically tied models.
+    """Grouped permutation importance for the statistically tied models, one axes.
 
-    One panel per model, sharing the feature axis so the ORDER can be compared, but
-    each with its own x-scale because the MAGNITUDES are not comparable: the models
-    agree on which features matter and disagree on how much. A shared x-axis would
-    squash the model with smaller drops and imply a precision the numbers do not
-    have. The Spearman rank correlation quantifies the agreement.
+    Two bars per feature, on a single shared x-axis, sorted by the importance of
+    the FIRST model -- the best one, whose ranking the report cites.
 
-    Features are ordered by the FIRST model's importance -- the best model, whose
-    ranking the report cites. Its panel therefore descends monotonically, and any
-    departure from that order in the second panel is exactly the disagreement the
-    figure exists to show. (Ordering by the mean rank across models would leave
-    neither panel monotonic, which reads as an error.)
+    A shared axis makes the magnitude difference plain rather than hiding it: the
+    models agree on which features matter (Spearman rho ~ 0.82) and disagree on how
+    much, so the second model's bars run visibly longer on the features it leans on.
+    Where its bars break the descending order of the first model's, that IS the
+    disagreement. The caption must state that importances are a ranking, not an
+    additive decomposition of Gini, and that magnitudes are estimator-specific.
     """
     order = agreement[model_names[0]].nlargest(top_n).index[::-1]      # best at top
     top = agreement.loc[order]
 
-    blocks = [_group_membership(f) or "other" for f in top.index]
-    unique_blocks = sorted(set(blocks))
-    palette = dict(zip(unique_blocks, qualitative_palette("Pastel1", len(unique_blocks))))
-    colours = [palette[b] for b in blocks]
+    colours = qualitative_palette("Pastel1", len(model_names))
+    positions = np.arange(len(top))
+    height = 0.8 / len(model_names)
 
-    rho = agreement[model_names[0]].corr(agreement[model_names[1]], method="spearman")
+    fig, ax = plt.subplots(figsize=(10, 0.52 * len(top) + 1.6))
+    for i, name in enumerate(model_names):
+        # First model on TOP of each group, so the visual order of the bars matches
+        # the reading order of the legend.
+        offset = ((len(model_names) - 1) / 2 - i) * height
+        ax.barh(positions + offset, top[name].to_numpy(), height,
+                color=colours[i], label=MODEL_DISPLAY_NAMES.get(name, name))
 
-    fig, axes = plt.subplots(
-        1, len(model_names), figsize=(6.2 * len(model_names), 0.42 * len(top) + 2.4),
-        sharey=True,
-    )
-    for ax, name in zip(np.atleast_1d(axes), model_names):
-        values = top[name].to_numpy()
-        ax.barh(range(len(top)), values, color=colours,
-                edgecolor="#5b6570", linewidth=0.4)
-        ax.axvline(0, linewidth=1, color="#8a939d")
-        for i, value in enumerate(values):
-            offset = 3 if value >= 0 else -3
-            ax.annotate(f"{value:.4f}", xy=(value, i), xytext=(offset, 0),
-                        textcoords="offset points", va="center",
-                        ha="left" if value >= 0 else "right", fontsize=7.5, color="#3d454d")
-        ax.set_title(name, loc="left", fontweight="bold", fontsize=10)
-        ax.set_xlabel("GINI lost when shuffled")
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.grid(axis="x", linewidth=0.5, alpha=0.4)
-        ax.margins(x=0.20)
-
-    first = np.atleast_1d(axes)[0]
-    first.set_yticks(range(len(top)))
-    first.set_yticklabels(top.index, fontsize=9)
-
-    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[b], ec="#5b6570", lw=0.4)
-               for b in unique_blocks]
-    np.atleast_1d(axes)[-1].legend(
-        handles, unique_blocks, title="feature block", frameon=False,
-        fontsize=8, title_fontsize=8, loc="lower right")
-
-    fig.suptitle(
-        f"Permutation importance, top {len(top)} features - the two statistically "
-        f"indistinguishable models\n"
-        f"Spearman rank correlation across all {len(agreement)} features: "
-        f"{rho:.3f}. Note the differing x-scales: the models agree on order, not magnitude.",
-        x=0.005, ha="left", fontweight="bold", fontsize=10.5,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    ax.set_yticks(positions)
+    ax.set_yticklabels(top.index)
+    ax.set_xlabel("Permutation importance (GINI lost when shuffled)")
+    ax.set_ylabel("Feature")
+    ax.legend(loc="lower right")
+    apply_simple_plot_style(ax)
+    fig.tight_layout()
 
     path = PLOT_DIR / "permutation_importance_comparison.png"
     fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
