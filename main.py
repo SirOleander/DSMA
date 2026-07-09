@@ -3888,6 +3888,19 @@ TOPK_PERM_SAMPLE = 5_000              # held-out rows per fold used for importan
 TOPK_PERM_REPEATS = 3                 # shuffles per feature per fold
 TOPK_IMPORTANCE_PLOT_N = 15           # features shown in the importance figure
 
+# The model whose importance ranking sorts the comparison figure and whose bar sits
+# on top of each pair. NOTE this is gradient boosting, not the best model: the
+# figure therefore shows GRADIENT BOOSTING's top-N features in ITS order, which is
+# not identical to the random forest's (they share 8 of their top 10). If the report
+# tabulates the random forest's ranking, say which model orders the figure.
+IMPORTANCE_PLOT_PRIMARY = "hist_gradient_boosting"
+
+# Orange and olive: entries 2 and 3 of the 8-colour Pastel1 ramp, matching the EDA
+# figures. Hard-coded rather than indexed out of qualitative_palette() because the
+# matplotlib fallback ramp (used when colorspace is absent) returns different hues,
+# and a figure's identity must not depend on an optional dependency.
+IMPORTANCE_PLOT_COLOURS = ("#F2CDB2", "#D4D8A7")
+
 # Shared by the top-k curve, the feature-group ablation, and the pairwise model
 # comparison. Every variant is scored on the SAME test rows, so their errors are
 # correlated and the difference between two of them is estimated far more precisely
@@ -5084,30 +5097,34 @@ def plot_importance_comparison(
 ) -> Path:
     """Grouped permutation importance for the statistically tied models, one axes.
 
-    Two bars per feature, on a single shared x-axis, sorted by the importance of
-    the FIRST model -- the best one, whose ranking the report cites.
+    Two bars per feature on a single shared x-axis. IMPORTANCE_PLOT_PRIMARY decides
+    which model sorts the features and is drawn on top of each pair; the features
+    shown are that model's top-N, in its order.
 
     A shared axis makes the magnitude difference plain rather than hiding it: the
     models agree on which features matter (Spearman rho ~ 0.82) and disagree on how
-    much, so the second model's bars run visibly longer on the features it leans on.
-    Where its bars break the descending order of the first model's, that IS the
-    disagreement. The caption must state that importances are a ranking, not an
-    additive decomposition of Gini, and that magnitudes are estimator-specific.
+    much, so one model's bars run visibly longer on the features it leans on. Where
+    the other model's bars break the descending order, that IS the disagreement. The
+    caption must state that importances are a ranking, not an additive decomposition
+    of Gini, and that magnitudes are estimator-specific.
     """
-    order = agreement[model_names[0]].nlargest(top_n).index[::-1]      # best at top
+    # Primary model first: it orders the features and sits on top of each pair.
+    ordered_models = sorted(model_names, key=lambda name: name != IMPORTANCE_PLOT_PRIMARY)
+    order = agreement[ordered_models[0]].nlargest(top_n).index[::-1]   # best at top
     top = agreement.loc[order]
 
-    colours = qualitative_palette("Pastel1", len(model_names))
+    colours = IMPORTANCE_PLOT_COLOURS
     positions = np.arange(len(top))
-    height = 0.8 / len(model_names)
+    height = 0.8 / len(ordered_models)
 
     fig, ax = plt.subplots(figsize=(10, 0.52 * len(top) + 1.6))
-    for i, name in enumerate(model_names):
-        # First model on TOP of each group, so the visual order of the bars matches
-        # the reading order of the legend.
-        offset = ((len(model_names) - 1) / 2 - i) * height
+    for i, name in enumerate(ordered_models):
+        # Primary model on TOP of each group, so the visual order of the bars
+        # matches the reading order of the legend.
+        offset = ((len(ordered_models) - 1) / 2 - i) * height
         ax.barh(positions + offset, top[name].to_numpy(), height,
-                color=colours[i], label=MODEL_DISPLAY_NAMES.get(name, name))
+                color=colours[i % len(colours)],
+                label=MODEL_DISPLAY_NAMES.get(name, name))
 
     ax.set_yticks(positions)
     ax.set_yticklabels(top.index)
