@@ -5080,6 +5080,79 @@ def plot_permutation_importance(
     return path
 
 
+def plot_importance_comparison(
+    agreement: pd.DataFrame, model_names: list[str], top_n: int = TOPK_IMPORTANCE_PLOT_N,
+) -> Path:
+    """Side-by-side permutation importance for the statistically tied models.
+
+    One panel per model, sharing the feature axis so the ORDER can be compared, but
+    each with its own x-scale because the MAGNITUDES are not comparable: the models
+    agree on which features matter and disagree on how much. A shared x-axis would
+    squash the model with smaller drops and imply a precision the numbers do not
+    have. The Spearman rank correlation quantifies the agreement.
+
+    Features are ordered by the FIRST model's importance -- the best model, whose
+    ranking the report cites. Its panel therefore descends monotonically, and any
+    departure from that order in the second panel is exactly the disagreement the
+    figure exists to show. (Ordering by the mean rank across models would leave
+    neither panel monotonic, which reads as an error.)
+    """
+    order = agreement[model_names[0]].nlargest(top_n).index[::-1]      # best at top
+    top = agreement.loc[order]
+
+    blocks = [_group_membership(f) or "other" for f in top.index]
+    unique_blocks = sorted(set(blocks))
+    palette = dict(zip(unique_blocks, qualitative_palette("Pastel1", len(unique_blocks))))
+    colours = [palette[b] for b in blocks]
+
+    rho = agreement[model_names[0]].corr(agreement[model_names[1]], method="spearman")
+
+    fig, axes = plt.subplots(
+        1, len(model_names), figsize=(6.2 * len(model_names), 0.42 * len(top) + 2.4),
+        sharey=True,
+    )
+    for ax, name in zip(np.atleast_1d(axes), model_names):
+        values = top[name].to_numpy()
+        ax.barh(range(len(top)), values, color=colours,
+                edgecolor="#5b6570", linewidth=0.4)
+        ax.axvline(0, linewidth=1, color="#8a939d")
+        for i, value in enumerate(values):
+            offset = 3 if value >= 0 else -3
+            ax.annotate(f"{value:.4f}", xy=(value, i), xytext=(offset, 0),
+                        textcoords="offset points", va="center",
+                        ha="left" if value >= 0 else "right", fontsize=7.5, color="#3d454d")
+        ax.set_title(name, loc="left", fontweight="bold", fontsize=10)
+        ax.set_xlabel("GINI lost when shuffled")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(axis="x", linewidth=0.5, alpha=0.4)
+        ax.margins(x=0.20)
+
+    first = np.atleast_1d(axes)[0]
+    first.set_yticks(range(len(top)))
+    first.set_yticklabels(top.index, fontsize=9)
+
+    handles = [plt.Rectangle((0, 0), 1, 1, color=palette[b], ec="#5b6570", lw=0.4)
+               for b in unique_blocks]
+    np.atleast_1d(axes)[-1].legend(
+        handles, unique_blocks, title="feature block", frameon=False,
+        fontsize=8, title_fontsize=8, loc="lower right")
+
+    fig.suptitle(
+        f"Permutation importance, top {len(top)} features - the two statistically "
+        f"indistinguishable models\n"
+        f"Spearman rank correlation across all {len(agreement)} features: "
+        f"{rho:.3f}. Note the differing x-scales: the models agree on order, not magnitude.",
+        x=0.005, ha="left", fontweight="bold", fontsize=10.5,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+
+    path = PLOT_DIR / "permutation_importance_comparison.png"
+    fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  saved {path}")
+    return path
+
+
 def plot_topk_curve(curve: pd.DataFrame, model_name: str) -> Path:
     """Test-set Gini as a function of feature-set size."""
     full = curve.iloc[-1]
@@ -5493,6 +5566,8 @@ def run_importance_agreement(
         print("property of the estimator: a high rank correlation with divergent")
         print("magnitudes means the models agree on what matters, not on how much.")
         print("Importances are a ranking, not an additive decomposition of Gini.")
+
+        plot_importance_comparison(table, list(model_names))
 
     path = OUTPUT_DIR / "feature_importance_agreement.csv"
     table.to_csv(path)
