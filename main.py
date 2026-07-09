@@ -5165,55 +5165,26 @@ def plot_importance_comparison(
 
 def plot_topk_curve(curve: pd.DataFrame, model_name: str) -> Path:
     """Test-set Gini as a function of feature-set size."""
-    full = curve.iloc[-1]
-    has_ci = "delta_vs_full_lo" in curve
-
-    # Two panels on purpose. The top shows the level, which is what a reader wants
-    # to see. The bottom shows the PAIRED difference from the full model, which is
-    # where the statistical claim actually lives. Plotting only the levels with
-    # their own error bars would be misleading: those intervals overlap heavily,
-    # tempting the reader to conclude "no difference", even though the paired
-    # difference is estimated far more precisely than either level.
-    fig, (ax, ax2) = plt.subplots(
-        2, 1, figsize=(9, 7), sharex=True, height_ratios=[2, 1.15],
-    )
+    # Levels only. The paired differences and their Bonferroni intervals are printed
+    # to the console and saved to topk_feature_curve.csv; they are NOT drawn here.
+    #
+    # Consequence to carry into the caption: this panel alone shows a rise to k=50
+    # and a dip at k=97, which invites the conclusion that 50 features beat the full
+    # model. It does not. The paired difference at k=50 is +0.0017 with a
+    # Bonferroni-adjusted 95% interval of [-0.0027, +0.0063], which contains zero.
+    # Quote the intervals in the caption, or the figure argues for something the
+    # data do not support.
+    fig, ax = plt.subplots(figsize=(9, 5.5))
 
     ax.plot(curve["n_features"], curve["gini"], marker="o", linewidth=2, color="#0f766e")
-    ax.axhline(full["gini"], linestyle="--", linewidth=1, color="#8a939d")
-    ax.annotate(f"full model ({int(full['n_features'])} features)",
-                xy=(full["n_features"], full["gini"]), xytext=(-6, -16),
-                textcoords="offset points", ha="right", fontsize=8.5, color="#5b6570")
     for _, row in curve.iterrows():
         ax.annotate(f"{row['gini']:.3f}", xy=(row["n_features"], row["gini"]),
-                    xytext=(0, 9), textcoords="offset points", ha="center", fontsize=8)
+                    xytext=(0, 9), textcoords="offset points", ha="center", fontsize=9)
+
+    ax.set_xlabel("Number of features (ranked by cross-validated permutation importance)")
     ax.set_ylabel("Test-set GINI")
-    ax.set_title(f"Feature-subset curve - {model_name}", loc="left", fontweight="bold", pad=12)
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(axis="y", linewidth=0.5, alpha=0.4)
-
-    if has_ci:
-        compare = curve.iloc[:-1]        # the full model is the reference, not a comparison
-        ax2.axhline(0, linewidth=1, color="#8a939d")
-        ax2.errorbar(
-            compare["n_features"], compare["delta_vs_full"],
-            yerr=[compare["delta_vs_full"] - compare["delta_vs_full_lo"],
-                  compare["delta_vs_full_hi"] - compare["delta_vs_full"]],
-            fmt="o", color="#0f766e", ecolor="#0f766e", elinewidth=1.4, capsize=4,
-            label="95% paired CI",
-        )
-        ax2.errorbar(
-            compare["n_features"], compare["delta_vs_full"],
-            yerr=[compare["delta_vs_full"] - compare["delta_bonf_lo"],
-                  compare["delta_bonf_hi"] - compare["delta_vs_full"]],
-            fmt="none", ecolor="#b45309", elinewidth=1, capsize=7, alpha=0.85,
-            label="Bonferroni-adjusted (family-wise 95%)",
-        )
-        ax2.set_ylabel("GINI vs full model")
-        ax2.legend(frameon=False, fontsize=8, loc="lower right")
-        ax2.spines[["top", "right"]].set_visible(False)
-        ax2.grid(axis="y", linewidth=0.5, alpha=0.4)
-
-    ax2.set_xlabel("Number of features (ranked by cross-validated permutation importance)")
+    apply_simple_plot_style(ax)
+    ax.margins(y=0.14)
     fig.tight_layout()
     path = PLOT_DIR / "topk_feature_curve.png"
     fig.savefig(path, dpi=200, bbox_inches="tight")
