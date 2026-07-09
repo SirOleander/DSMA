@@ -3901,6 +3901,17 @@ IMPORTANCE_PLOT_PRIMARY = "hist_gradient_boosting"
 # and a figure's identity must not depend on an optional dependency.
 IMPORTANCE_PLOT_COLOURS = ("#F2CDB2", "#D4D8A7")
 
+# Features shown in the two-model comparison figure. Fewer than the single-model
+# figure: two bars per feature need the vertical room.
+IMPORTANCE_COMPARISON_TOP_N = 12
+
+# Exact pixel width of the comparison figure. Achieved by sizing the canvas as
+# width_px / dpi and saving WITHOUT bbox_inches="tight", which would re-crop the
+# figure after rendering and silently change the output size. tight_layout()
+# reserves the margins instead, so the y-labels still fit.
+IMPORTANCE_PLOT_WIDTH_PX = 2800
+IMPORTANCE_PLOT_DPI = 300
+
 # Shared by the top-k curve, the feature-group ablation, and the pairwise model
 # comparison. Every variant is scored on the SAME test rows, so their errors are
 # correlated and the difference between two of them is estimated far more precisely
@@ -5093,7 +5104,8 @@ def plot_permutation_importance(
 
 
 def plot_importance_comparison(
-    agreement: pd.DataFrame, model_names: list[str], top_n: int = TOPK_IMPORTANCE_PLOT_N,
+    agreement: pd.DataFrame, model_names: list[str],
+    top_n: int = IMPORTANCE_COMPARISON_TOP_N,
 ) -> Path:
     """Grouped permutation importance for the statistically tied models, one axes.
 
@@ -5117,7 +5129,8 @@ def plot_importance_comparison(
     positions = np.arange(len(top))
     height = 0.8 / len(ordered_models)
 
-    fig, ax = plt.subplots(figsize=(10, 0.52 * len(top) + 1.6))
+    width_inches = IMPORTANCE_PLOT_WIDTH_PX / IMPORTANCE_PLOT_DPI
+    fig, ax = plt.subplots(figsize=(width_inches, 0.60 * len(top) + 1.8))
     for i, name in enumerate(ordered_models):
         # Primary model on TOP of each group, so the visual order of the bars
         # matches the reading order of the legend.
@@ -5134,8 +5147,10 @@ def plot_importance_comparison(
     apply_simple_plot_style(ax)
     fig.tight_layout()
 
+    # No bbox_inches="tight" here: it re-crops after rendering, so the saved width
+    # would not be the requested IMPORTANCE_PLOT_WIDTH_PX.
     path = PLOT_DIR / "permutation_importance_comparison.png"
-    fig.savefig(path, dpi=300, bbox_inches="tight", facecolor="white")
+    fig.savefig(path, dpi=IMPORTANCE_PLOT_DPI, facecolor="white")
     plt.close(fig)
     print(f"  saved {path}")
     return path
