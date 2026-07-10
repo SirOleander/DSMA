@@ -69,24 +69,30 @@ package or multiple modules.** Keep everything in the single file unless the use
 ## How to run
 
 - Requires Python 3.11 with pandas, numpy, matplotlib, requests, and **scikit-learn >= 1.4** (earlier versions lack `HistGradientBoostingClassifier(class_weight=...)` and `KBinsDiscretizer(encode="onehot-dense")`). See `zenvironment.yaml`; see `README.md` for the end-user runbook.
-  - The full modelling stage searches 187 hyperparameter configurations (561 fits at 3-fold). A complete `RUN_INGESTION + RUN_EDA + RUN_MODELING` run takes ~25 minutes. Set `DO_GRID_SEARCH = False` for fast reruns.
+  - The full modelling stage searches 187 hyperparameter configurations (561 fits at 3-fold). A complete run takes ~25 minutes. Set `DO_GRID_SEARCH = False` for fast reruns.
   - `colorspace` is **optional**: it supplies the EDA palettes and `qualitative_palette` falls back to matplotlib colormaps when it is absent. A missing plotting dependency must never stop the modelling pipeline — do not restore the hard import.
   - `wordcloud` is optional: it is imported lazily and skipped if not installed.
 - **`DATA_DIR` is not hard-coded.** `_resolve_data_dir` checks `$DSMA_DATA_DIR`, then `./data` beside `main.py`, then `../data` beside the repo, accepting a candidate only if it already contains `raw/`. Do not replace this with an absolute path: the file is submitted as a report appendix and must run on a grader's machine.
 - Entry point: run `python main.py`.
-- The project is one linear pipeline, gated by three stage toggles at the top of
-  the file (not inside `main()`):
-  - `RUN_INGESTION` — parse the raw CSVs, clean, merge, and enrich with NOAA
-    weather, rebuilding the cached enriched dataset from raw. Turn OFF to skip
-    ingestion and load the cached dataset instead (fast reruns).
-  - `RUN_EDA` — run EDA on the raw, untransformed enriched dataset.
-  - `RUN_MODELING` — run the EDA-informed transition, model training and
-    comparison, and exported results.
-  - Each stage hands off through the cached enriched dataset, so EDA or modelling
-    can run straight from the cache. If `RUN_INGESTION` is off and no cache
-    exists, `main()` raises a clear error telling you to turn it on once.
-  - Note: ingestion rebuilds the dataset from raw, but the NOAA weather download
-    stays cached, so it is not re-downloaded.
+- The project is one unconditional linear pipeline. There are no stage toggles:
+  every run parses the raw CSVs, cleans, merges, enriches with NOAA weather, runs
+  EDA, then runs the EDA-informed transition, model training and comparison, and
+  exported results. Do not reintroduce toggles.
+  - Note: the raw NOAA download stays cached (`WEATHER_CACHE_PKL`), so it is not
+    re-fetched. Everything downstream of that payload is rebuilt from scratch.
+- Feature drops are **ordered so that each drop follows the analysis justifying
+  it**. Preserve this ordering:
+  - `drop_low_signal_features` runs *before* `eda_main`, so those features never
+    appear in the EDA tables.
+  - `build_model_dataset` (identifiers → `DROP_FOR_REDUNDANCY` → log-transform)
+    runs *after* `eda_main`, whose correlation/VIF diagnostics justify the
+    redundancy drops.
+  - `DROP_FOR_REDUNDANCY` is a hardcoded list, deliberately. `eda_main` computes
+    its own multicollinearity drop set for the audit table but does not feed it
+    into modelling; the two are kept in agreement by hand.
+- To iterate on a single function without a full run, import the module rather
+  than editing it: `main.py` is import-safe (module level defines only constants
+  and two `mkdir`s; the pipeline is behind `if __name__ == "__main__"`).
 - The pipeline runs in memory end-to-end.
 - Only two artefacts are cached to disk as pickles:
   - the weather-enriched dataset (the single dataset feeding EDA and modelling)

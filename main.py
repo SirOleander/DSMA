@@ -11,6 +11,9 @@ Just run the file:
 
     python main.py
 
+Every stage runs on every invocation; there are no toggles and nothing is
+resumed from a cached dataset.
+
 Only two files are written: the final enriched dataset and a cached copy of the
 NOAA weather download (so reruns don't re-download). Plots and the model-metrics
 table are written to the output folders.
@@ -69,15 +72,12 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
     average_precision_score,
+    precision_recall_curve,
     confusion_matrix,
     ConfusionMatrixDisplay,
 )
 
 
-
-RUN_INGESTION = False
-RUN_EDA = True
-RUN_MODELING = True
 
 def _resolve_data_dir() -> Path:
     """Locate the data directory without hard-coding one machine's layout.
@@ -862,9 +862,7 @@ def _strip_python_repr_quotes(value):
 def normalize_attribute_levels(dataset: pd.DataFrame) -> pd.DataFrame:
     """Collapse the u'x' / 'x' duplicate levels in the attributes.* columns.
 
-    Idempotent: running it on already-clean data changes nothing. It is called
-    both during ingestion (so newly built caches are clean) and after loading a
-    cached dataset (so caches built before this fix are repaired on load).
+    Idempotent: running it on already-clean data changes nothing.
     """
     dataset = dataset.copy()
     columns = [c for c in dataset.columns if c.startswith("attributes.")]
@@ -2393,6 +2391,7 @@ def run_target_analysis(df: pd.DataFrame) -> None:
             ylabel="Number of reviews",
             filename="review_stars_distribution.png",
             rotate_labels=False,
+            colors=qualitative_palette("Pastel1", len(stars)),
         )
 
 
@@ -2461,6 +2460,7 @@ def run_satisfaction_by_group(df: pd.DataFrame) -> None:
             by_city, "city", "satisfaction_rate_percent",
             title="", xlabel="City", ylabel="Satisfaction rate (%)",
             filename="satisfaction_by_city.png", hline=overall,
+            colors=qualitative_palette("Pastel1", len(by_city)),
         )
 
     if "review_month" in df.columns:
@@ -2475,6 +2475,7 @@ def run_satisfaction_by_group(df: pd.DataFrame) -> None:
             by_season, "season", "satisfaction_rate_percent",
             title="", xlabel="Season", ylabel="Satisfaction rate (%)",
             filename="satisfaction_by_season.png", rotate_labels=False, hline=overall,
+            colors=qualitative_palette("Pastel1", len(by_season)),
         )
 
     if "review_weekday" in df.columns:
@@ -2592,14 +2593,13 @@ def run_satisfaction_by_category(df: pd.DataFrame, top_n: int = 15) -> None:
         max_rows=max(top_n, len(top)),
     )
 
-    plot_df = top.sort_values("satisfaction_rate_percent")
-    colors = qualitative_palette("Pastel1", len(plot_df))
-    plt.figure(figsize=(11, 7))
-    plt.barh(plot_df["category"].astype(str), plot_df["satisfaction_rate_percent"], color=colors)
-    plt.axvline(overall, color="0.35", linestyle="--", linewidth=1.2)
-    plt.xlabel("Satisfaction rate (%)")
-    plt.ylabel("Restaurant category")
-    save_current_plot("satisfaction_by_category.png")
+    plot_df = top.sort_values("satisfaction_rate_percent", ascending=False)
+    plot_bar(
+        plot_df, "category", "satisfaction_rate_percent",
+        title="", xlabel="Restaurant category", ylabel="Satisfaction rate (%)",
+        filename="satisfaction_by_category.png", hline=overall,
+        colors=qualitative_palette("Pastel1", len(plot_df)),
+    )
 
 
 def run_satisfied_vs_dissatisfied_comparison(df: pd.DataFrame) -> None:
@@ -3071,8 +3071,9 @@ def select_compact_target_correlated_features(
     threshold: float = 0.05,
     min_features: int = 8,
     max_features: int = 10,
+    feature_label: str = "numerical",
 ) -> pd.DataFrame:
-    """Select reduced numeric features most associated with the target for the paper plot."""
+    """Select reduced features most associated with the target for the paper plot."""
     if TARGET not in df.columns or not pd.api.types.is_numeric_dtype(df[TARGET]):
         return final_features.iloc[:, :0].copy()
 
@@ -3105,7 +3106,7 @@ def select_compact_target_correlated_features(
     selected["abs_correlation"] = selected["abs_correlation"].round(4)
     print_table(
         selected,
-        "Variables selected for compact main-text numerical correlation matrix",
+        f"Variables selected for compact main-text {feature_label} correlation matrix",
         max_rows=max(max_features, len(selected)),
     )
     return final_features[selected["variable"].tolist()].copy()
@@ -3114,18 +3115,26 @@ def select_compact_target_correlated_features(
 def plot_compact_main_text_correlation_matrix(
     final_features: pd.DataFrame,
     df: pd.DataFrame,
+    feature_label: str = "numerical",
+    filename: str = "correlation_matrix_main_text.png",
+    max_features: int = 10,
 ) -> None:
-    """Plot a compact target-focused numerical correlation matrix for the main paper."""
-    compact_features = select_compact_target_correlated_features(final_features, df)
+    """Plot a compact target-focused correlation matrix for the main paper."""
+    compact_features = select_compact_target_correlated_features(
+        final_features,
+        df,
+        max_features=max_features,
+        feature_label=feature_label,
+    )
     if compact_features.shape[1] < 2:
-        print("Not enough compact numerical features for the main-text correlation matrix.")
+        print(f"Not enough compact {feature_label} features for the main-text correlation matrix.")
         return
 
     plot_reduced_correlation_matrix(
         compact_features,
         df,
-        filename="correlation_matrix_main_text.png",
-        title="Compact numerical correlation matrix for variables most associated with satisfaction",
+        filename=filename,
+        title=f"Compact {feature_label} correlation matrix for variables most associated with satisfaction",
         annotate_cells=True,
     )
 
@@ -3250,6 +3259,14 @@ def run_reduced_correlation_vif_workflow(
     )
     if feature_type == "Continuous numeric":
         plot_compact_main_text_correlation_matrix(final_features, df)
+    elif feature_type == "Binary indicator":
+        plot_compact_main_text_correlation_matrix(
+            final_features,
+            df,
+            feature_label="binary",
+            filename="binary_correlation_matrix_main_text.png",
+            max_features=15,
+        )
     return final_features, diagnostics
 
 
@@ -3650,6 +3667,9 @@ DO_LEARNING_CURVE = True
 LEARNING_CURVE_MODELS = ("hist_gradient_boosting", "logistic_regression")
 LEARNING_CURVE_SIZES = (10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000)
 LEARNING_CURVE_TEST_SIZE = 250_000
+
+DO_PR_CURVE = True
+PR_CURVE_MODELS = ("hist_gradient_boosting", "logistic_regression")
 
 DO_TOPK_CURVE = True
 TOPK_VALUES = (5, 10, 25, 50, None)
@@ -5100,6 +5120,71 @@ def run_importance_agreement(
 
 
 
+def run_pr_curve_dissatisfied(fitted: dict, X_test, y_test) -> pd.DataFrame:
+    """Precision-Recall curve for the DISSATISFIED (minority, y=0) class.
+
+    The satisfied/dissatisfied split is roughly 70/30, so the minority
+    dissatisfied class is the actionable one and the whole metric suite is built
+    around it. Each model's satisfied-probability score is negated so a high
+    score means 'likely dissatisfied', which makes the area under this curve the
+    pr_auc_dissat already reported in the evaluation tables (average precision of
+    exactly this curve). The dashed line is the no-skill baseline: the
+    dissatisfied base rate, which a random ranker reaches at every recall.
+
+    Models are overlaid (same two as the learning curve) so the plot tells the
+    same two-model story as the rest of the modelling section.
+    """
+    print_section("Precision-Recall curve (dissatisfied class)")
+
+    y_true = np.asarray(y_test)
+    y_dissat = (y_true == 0).astype(int)
+    base_rate = float(y_dissat.mean())
+    print(f"Dissatisfied base rate (no-skill precision): {base_rate:.4f}")
+
+    models = [m for m in PR_CURVE_MODELS if m in fitted]
+    if not models:
+        print("None of the PR_CURVE_MODELS are available; skipping the PR curve.")
+        return pd.DataFrame()
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    palette = dict(zip(models, IMPORTANCE_PLOT_COLOURS))
+
+    rows = []
+    for name in models:
+        y_score = get_scores(fitted[name], X_test)
+        if y_score is None:
+            print(f"  {name}: no probability/decision scores available, skipped.")
+            continue
+        dissat_score = -np.asarray(y_score, dtype=float)
+        precision, recall, _ = precision_recall_curve(y_dissat, dissat_score)
+        ap = average_precision_score(y_dissat, dissat_score)
+        ax.plot(recall, precision, linewidth=2.6,
+                label=f"{MODEL_DISPLAY_NAMES.get(name, name)} (AP = {ap:.3f})",
+                color=palette.get(name))
+        rows.append({"model": name, "pr_auc_dissat": ap})
+        print(f"  {name:24s} PR-AUC (dissatisfied) = {ap:.4f}")
+
+    ax.axhline(base_rate, color="0.35", linestyle="--", linewidth=1.2,
+               label=f"No-skill baseline ({base_rate:.3f})")
+    ax.set_xlabel("Recall (dissatisfied)")
+    ax.set_ylabel("Precision (dissatisfied)")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc="upper right")
+    apply_simple_plot_style(ax)
+    fig.tight_layout()
+    path = PLOT_DIR / "pr_curve_dissatisfied.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path}")
+
+    summary = pd.DataFrame(rows)
+    if not summary.empty:
+        summary.to_csv(OUTPUT_DIR / "pr_curve_dissatisfied.csv", index=False)
+        print(f"Saved: {OUTPUT_DIR / 'pr_curve_dissatisfied.csv'}")
+    return summary
+
+
 def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
     """Test-set Gini as a function of TRAINING-SET SIZE, on the full dataset.
 
@@ -5363,6 +5448,9 @@ def models_main(df: pd.DataFrame) -> None:
         run_feature_group_ablation(
             ablation_model, best_params, X_train, y_train, X_test, y_test)
 
+    if DO_PR_CURVE:
+        run_pr_curve_dissatisfied(fitted, X_test, y_test)
+
     if DO_LEARNING_CURVE:
         run_learning_curve(X_full, y_full, best_params)
 
@@ -5370,52 +5458,38 @@ def models_main(df: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    """Run the project as one linear pipeline, gated by the stage toggles.
+    """Run the project end to end as one linear pipeline.
 
         ingestion -> preprocessing -> weather merge -> EDA -> modelling -> results
 
-    The three toggles at the top of the file (RUN_INGESTION, RUN_EDA,
-    RUN_MODELING) decide which stages run. All stages hand off through the cached
-    enriched dataset (DATASET_PKL):
+    Every stage runs on every invocation: the raw CSVs are parsed, cleaned and
+    merged, NOAA weather is joined on, and the resulting dataset flows straight
+    into EDA and then modelling. Nothing is loaded from a cached dataset.
 
-      - RUN_INGESTION on : parse raw CSVs, clean, merge, enrich with NOAA weather
-                           and rebuild DATASET_PKL from scratch.
-      - RUN_INGESTION off: skip ingestion and load DATASET_PKL from the cache, so
-                           EDA and/or modelling can run without re-parsing raw data.
+    Feature drops are sequenced so each one happens after the analysis that
+    justifies it. Low-signal features go first, before EDA, so they never enter
+    the EDA tables. The redundancy drops happen inside build_model_dataset,
+    after eda_main has printed the correlation and VIF diagnostics that motivate
+    them.
 
-    This means you can, for example, iterate on the EDA write-up (RUN_EDA on,
-    the other two off) or the modelling section (RUN_MODELING on, the other two
-    off) without repeating the expensive ingestion stage each time.
+    The NOAA download itself stays cached (WEATHER_CACHE_PKL): the raw payload is
+    fixed historical data, so re-fetching it every run would only add an API
+    round-trip. Everything downstream of that payload is rebuilt from scratch.
     """
-    if RUN_INGESTION:
-        tables = load_raw_data()
-        processed = process_data(tables)
-        enriched = build_weather_enriched(processed)
-    else:
-        if not DATASET_PKL.exists():
-            raise FileNotFoundError(
-                f"RUN_INGESTION is off but no cached dataset was found at:\n"
-                f"  {DATASET_PKL}\n"
-                "Set RUN_INGESTION = True to build it once from the raw data."
-            )
-        print(f"Loading cached enriched dataset: {DATASET_PKL}")
-        enriched = pd.read_pickle(DATASET_PKL)
-        enriched = normalize_attribute_levels(enriched)
+    tables = load_raw_data()
+    processed = process_data(tables)
+    enriched = build_weather_enriched(processed)
 
     enriched = drop_low_signal_features(enriched)
 
-    if RUN_EDA:
-        eda_main(enriched)
+    eda_main(enriched)
 
-    model_df = None
-    if RUN_MODELING:
-        model_df = build_model_dataset(enriched)
-        models_main(model_df)
+    model_df = build_model_dataset(enriched)
+    models_main(model_df)
 
     print("\nDone.")
     print(f"Enriched dataset:  {enriched.shape[0]:,} rows x {enriched.shape[1]} columns")
-    if model_df is not None:
-        print(f"Modelling dataset: {model_df.shape[0]:,} rows x {model_df.shape[1]} columns")
+    print(f"Modelling dataset: {model_df.shape[0]:,} rows x {model_df.shape[1]} columns")
 
 
 if __name__ == "__main__":

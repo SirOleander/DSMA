@@ -65,39 +65,23 @@ $env:DSMA_DATA_DIR = "D:\path\to\data"
 
 ## 3. Running it
 
-Open `main.py` and set the three stage toggles near the top:
-
-```python
-RUN_INGESTION = True    # first run: build the dataset from the raw CSVs
-RUN_EDA       = True
-RUN_MODELING  = True
-```
-
-Then:
-
 ```bash
 python main.py
 ```
 
-A first, complete run takes roughly **25 minutes** and needs several GB of RAM.
-It downloads daily weather summaries from NOAA (no API key required), so it needs
-internet access. If any city fails to download, the pipeline **stops with an
-error** rather than continuing with missing weather — see §5.
+That's the whole interface. There is nothing to configure and no stages to
+enable: every run rebuilds the dataset from the raw CSVs, enriches it with NOAA
+weather, runs the EDA, and then trains and compares the models.
 
-### Faster re-runs
+A complete run takes roughly **25 minutes** and needs several GB of RAM. It
+downloads daily weather summaries from NOAA (no API key required), so the first
+run needs internet access. If any city fails to download, the pipeline **stops
+with an error** rather than continuing with missing weather — see §5.
 
-Ingestion caches the enriched dataset. Afterwards, set `RUN_INGESTION = False`
-and the other stages read the cache directly:
-
-| Goal | Toggles |
-|---|---|
-| Iterate on the EDA | `False, True, False` |
-| Iterate on the modelling | `False, False, True` |
-| Rebuild everything from raw | `True, True, True` |
-
-With `RUN_INGESTION = False` and no cache present, `main()` raises a clear error
-telling you to turn it on once. The NOAA download is cached separately and is
-never repeated.
+The NOAA download is cached to disk on the first run and reused afterwards, so
+later runs rebuild everything else from scratch but never re-fetch the weather.
+Setting `DO_GRID_SEARCH = False` in `main.py` skips the 187-configuration
+hyperparameter search, which is the bulk of the 25 minutes.
 
 ## 4. Outputs
 
