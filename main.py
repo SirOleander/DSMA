@@ -32,13 +32,10 @@ from matplotlib.colors import TwoSlopeNorm
 
 from matplotlib.colors import to_hex
 
-# colorspace supplies the EDA plot palettes. It is an uncommon package, and a
-# missing *plotting* dependency must not be able to stop the modelling pipeline
-# from running, so it is imported optionally (see qualitative_palette).
 try:
     from colorspace import qualitative_hcl
     _HAS_COLORSPACE = True
-except ImportError:                                     # pragma: no cover
+except ImportError:
     qualitative_hcl = None
     _HAS_COLORSPACE = False
 
@@ -77,41 +74,11 @@ from sklearn.metrics import (
 )
 
 
-# ================================================================================
-# CONFIGURATION
-# ================================================================================
 
-# ---------------------------------------------------------------------------
-# Pipeline stage toggles  (run only the parts you need)
-# ---------------------------------------------------------------------------
-# The project is one linear pipeline:
-#     ingestion -> preprocessing -> weather merge -> EDA -> modelling -> results
-# Each stage is gated below so parts can be run in isolation. The stages hand
-# off through the cached enriched dataset (DATASET_PKL), so EDA or modelling can
-# run straight from the cache without repeating the expensive ingestion stage.
-#
-#   RUN_INGESTION  Stage 1-2b: parse raw CSVs, clean, merge, and enrich with
-#                  NOAA weather, rebuilding the cached enriched dataset from raw.
-#                  Turn OFF to skip ingestion and load the cached dataset.
-#   RUN_EDA        Stage 3: exploratory data analysis on the raw, untransformed
-#                  enriched dataset (before any log transform).
-#   RUN_MODELING   Stages 4-6: EDA-informed feature transition, model training
-#                  and comparison, and exported results.
-#
-# Typical use while writing the paper:
-#   - writing EDA:       RUN_INGESTION = False, RUN_EDA = True,  RUN_MODELING = False
-#   - writing modelling: RUN_INGESTION = False, RUN_EDA = False, RUN_MODELING = True
-#   - full end-to-end:   RUN_INGESTION = True,  RUN_EDA = True,  RUN_MODELING = True
-#
-# Note: ingestion rebuilds the dataset from the raw CSVs, but the NOAA weather
-# download stays cached (WEATHER_CACHE_PKL), so it is not re-downloaded.
 RUN_INGESTION = False
 RUN_EDA = True
 RUN_MODELING = True
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 def _resolve_data_dir() -> Path:
     """Locate the data directory without hard-coding one machine's layout.
 
@@ -135,8 +102,6 @@ def _resolve_data_dir() -> Path:
     return here / "data"
 
 
-# Put the six exported raw CSVs in <DATA_DIR>/raw/ and nothing needs editing.
-# The processed/ and external/ subdirectories are created automatically.
 DATA_DIR = _resolve_data_dir()
 RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
@@ -145,41 +110,17 @@ EXTERNAL_DATA_DIR = DATA_DIR / "external"
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 EXTERNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Sample size
-# ---------------------------------------------------------------------------
-# Review sample size used to build the modeling/EDA dataset.
 SAMPLE_SIZE = 4_622_091
 
-# ---------------------------------------------------------------------------
-# Saved files (single source of truth)
-# ---------------------------------------------------------------------------
-# The whole pipeline runs in memory in one pass. Only two files are written:
-#   - DATASET_PKL: the final weather-enriched dataset (the one full dataset).
-#   - WEATHER_CACHE_PKL: a cache of the cleaned NOAA download so repeated runs
-#     don't re-hit the NOAA API. Both are pickles (fast, lossless, and they
-#     preserve the optimised dtypes); they are never opened outside this code.
 DATASET_PKL = PROCESSED_DATA_DIR / f"restaurant_model_sample_{SAMPLE_SIZE // 1000}k_weather.pkl"
 WEATHER_CACHE_PKL = EXTERNAL_DATA_DIR / "noaa_weather_daily_top_cities.pkl"
 
-# ---------------------------------------------------------------------------
-# Modelling metadata (single source of truth for downstream scripts)
-# ---------------------------------------------------------------------------
 ID_COLS = ["review_id", "business_id", "user_id"]
 
-# Binary classification target: 1 if the review awarded >= 4 stars. Single
-# source of truth used by both the EDA and the modelling stages.
 TARGET = "satisfied"
 
-# Columns that must be excluded from modelling because they leak the target.
-# - review_stars: satisfied is derived directly from it.
-# - business_stars / user_average_stars: all-time averages that already include
-#   the current review's rating (target + temporal leakage). Kept for EDA only.
 LEAKAGE_COLS = ["review_stars", "business_stars", "user_average_stars"]
 
-# ---------------------------------------------------------------------------
-# Weather schema (single source of truth for the NOAA download + merge)
-# ---------------------------------------------------------------------------
 WEATHER_KEY_COLS = ["city", "state", "review_date"]
 
 WEATHER_NUMERIC_COLS = [
@@ -200,12 +141,8 @@ WEATHER_BINARY_COLS = [
 
 WEATHER_FEATURE_COLS = WEATHER_NUMERIC_COLS + WEATHER_BINARY_COLS
 
-# Columns used to decide whether a weather record was matched. Identical to the
-# full weather feature set; kept as a named alias to document that intent.
 WEATHER_AVAILABILITY_COLS = WEATHER_FEATURE_COLS
 
-# NOAA is queried with units=metric, so temperatures are degrees Celsius and
-# depths are millimetres. Used only to label the weather summary table.
 WEATHER_UNITS = {
     "weather_prcp": "mm",
     "weather_snow": "mm",
@@ -219,17 +156,8 @@ WEATHER_UNITS = {
     "is_cold": "0/1",
 }
 
-# Global random seed (single source of truth).
 RANDOM_STATE = 42
 
-# The Naive Bayes preprocessor quantile-bins the continuous features. Several of
-# them are zero-inflated (weather_snow is 76% zeros, log_tip_compliment_count
-# 60%, log_user_fans 48%) or near-discrete (hours_open_days_count has 8 distinct
-# values), so they cannot be cut into 20 distinct quantiles. scikit-learn drops
-# the degenerate zero-width bins and warns once per feature per fit -- correct
-# behaviour, but it emitted 525 identical warnings across a grid search. The
-# warning is silenced here, not the behaviour: a feature simply ends up with
-# fewer effective bins than requested, which is exactly what we want.
 warnings.filterwarnings(
     "ignore",
     message="Bins whose width are too small",
@@ -238,16 +166,8 @@ warnings.filterwarnings(
 )
 
 
-# ================================================================================
-# SHARED REPORTING HELPERS
-# ================================================================================
 
-# ---------------------------------------------------------------------------
-# Printing primitives
-# ---------------------------------------------------------------------------
 
-# colorspace palette name -> nearest qualitative matplotlib colormap, used when
-# colorspace is not installed. Only the EDA figures change; no result depends on it.
 _FALLBACK_PALETTES = {"Warm": "Set2", "Pastel1": "Pastel1"}
 
 
@@ -360,9 +280,6 @@ def report_dropped_variable_table(
         max_rows=max_rows,
     )
 
-# ================================================================================
-# 1. IMPORT DATA  (parse raw pgAdmin JSON exports)
-# ================================================================================
 
 RAW_FILES = {
     "business": "restaurant_business_raw.csv",
@@ -436,13 +353,7 @@ def load_raw_data() -> dict[str, pd.DataFrame]:
     print("Raw data loading completed.")
     return tables
 
-# ================================================================================
-# 2. PROCESS DATA  (clean, merge, sample, log features)
-# ================================================================================
 
-# ---------------------------------------------------------------------------
-# Study scope
-# ---------------------------------------------------------------------------
 
 MIN_REVIEW_YEAR = 2010
 
@@ -460,8 +371,6 @@ SELECTED_CITY_STATE_SCOPE = [
 ]
 
 
-# String / categorical columns. Single source of truth used both for the
-# "Unknown" cleaning step and for the category-dtype memory optimisation.
 CATEGORICAL_COLUMNS = [
     "city",
     "state",
@@ -483,7 +392,6 @@ CATEGORICAL_COLUMNS = [
     "attributes.RestaurantsAttire",
 ]
 
-# Count columns whose missing values genuinely mean "no record" -> fill with 0.
 COUNT_COLUMNS = [
     "checkin_count",
     "tip_count",
@@ -496,9 +404,6 @@ COUNT_COLUMNS = [
     "photo_outside",
 ]
 
-# Business-level subfeature extraction. Category dummies are limited to the most
-# common categories (excluding the universal "Restaurants" tag) so the
-# review-level modelling table stays tractable.
 CATEGORY_DUMMY_TOP_N = 30
 EXCLUDED_CATEGORY_DUMMIES = {"Restaurants"}
 
@@ -943,11 +848,6 @@ def merge_tables(
 
     return dataset
 
-# Yelp stores nested business attributes as PYTHON 2 REPR STRINGS, so the same
-# level arrives under two spellings: "u'quiet'" and "'quiet'". Left untouched they
-# become two separate one-hot columns, splitting a single effect across two
-# coefficients and inflating the design matrix. Observed on NoiseLevel, Alcohol,
-# WiFi, RestaurantsAttire and others.
 _QUOTED_LEVEL = re.compile(r"^[ub]?(['\"])(?P<value>.*)\1$")
 
 
@@ -1357,11 +1257,7 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
         .str.replace(r"\s+", " ", regex=True)
     )
 
-    # Only keep city-standardisation rules that can map into the final
-    # top-10 study scope. Cities outside this scope are intentionally not
-    # standardised here because filter_study_scope() removes them later.
     city_replacements = {
-        # Philadelphia
         'Bala Cynwyd': 'Philadelphia',
         'Center City': 'Philadelphia',
         'Chestnut Hill': 'Philadelphia',
@@ -1386,7 +1282,6 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
         'South Philadelphia': 'Philadelphia',
         'University City': 'Philadelphia',
 
-        # New Orleans
         'Algiers': 'New Orleans',
         'Bucktown': 'New Orleans',
         'Bywater': 'New Orleans',
@@ -1394,7 +1289,6 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
         'new orleans': 'New Orleans',
         'NEW ORLEANS': 'New Orleans',
 
-        # Nashville
         'Antioch': 'Nashville',
         'Belle Meade': 'Nashville',
         'Berry Hill': 'Nashville',
@@ -1412,7 +1306,6 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
         'Nashville-Davidson metropolitan gover': 'Nashville',
         'Old Hickory': 'Nashville',
 
-        # Tampa
         'Carrollwood': 'Tampa',
         'Greater Northdale': 'Tampa',
         'South Tampa': 'Tampa',
@@ -1429,18 +1322,15 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
         'Town n Country': 'Tampa',
         'Westchase': 'Tampa',
 
-        # Indianapolis
         'Indianaplois': 'Indianapolis',
         'INDIANAPOLIS': 'Indianapolis',
         'indianapolis': 'Indianapolis',
         'indianopolis': 'Indianapolis',
         'INpolis': 'Indianapolis',
 
-        # Tucson
         'tucson': 'Tucson',
         'TUCSON': 'Tucson',
 
-        # Saint Louis
         'SAINT LOUIS': 'Saint Louis',
         'saint louis': 'Saint Louis',
         'Saint Louis,': 'Saint Louis',
@@ -1456,18 +1346,15 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
         'St. Louis County': 'Saint Louis',
         'St.Louis': 'Saint Louis',
 
-        # Reno
         'RENO': 'Reno',
         'reno': 'Reno',
 
-        # Santa Barbara
         'SANTA BARBARA': 'Santa Barbara',
         'santa barbara': 'Santa Barbara',
         'Santa barbra': 'Santa Barbara',
         'Santa Barbra': 'Santa Barbara',
         'santa barbra': 'Santa Barbara',
 
-        # Saint Petersburg
         'saint petersburg': 'Saint Petersburg',
         'SAINT PETERSBURG': 'Saint Petersburg',
         'Saint Petersburg': 'Saint Petersburg',
@@ -1487,21 +1374,15 @@ def standardize_city_names(dataset: pd.DataFrame) -> pd.DataFrame:
     return dataset
 
 
-# Skewed, non-negative count features that are log1p-transformed at the
-# modelling stage (after EDA). Shared by the EDA skewness comparison and the
-# log-and-replace step so the two never drift apart.
 LOG_CANDIDATES = [
-    # Business activity / popularity
     "business_review_count",
 
-    # User activity / history
     "user_review_count",
     "user_useful",
     "user_funny",
     "user_cool",
     "user_fans",
 
-    # Business engagement / activity
     "checkin_count",
     "tip_count",
     "tip_compliment_count",
@@ -1512,7 +1393,6 @@ LOG_CANDIDATES = [
     "photo_inside",
     "photo_outside",
 
-    # Review-level behavior
     "review_useful",
     "review_funny",
     "review_cool",
@@ -1606,22 +1486,14 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
     """Select final columns for EDA and modeling."""
 
     model_columns = [
-        # IDs
         "review_id",
         "business_id",
         "user_id",
 
-        # Target
         "satisfied",
 
-        # LEAKAGE WARNING: keep for EDA only, exclude from modelling.
-        # review_stars: the target is derived directly from it.
-        # business_stars / user_average_stars (below): all-time averages that
-        # already include this review's rating, so they leak the target and are
-        # also temporal leakage. See config.LEAKAGE_COLS.
         "review_stars",
 
-        # Review-level variables
         "review_text_length",
         "review_useful",
         "review_funny",
@@ -1631,7 +1503,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "review_weekday",
         "review_date",
 
-        # Business-level variables
         "business_stars",
         "business_review_count",
         "is_open",
@@ -1656,14 +1527,11 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "attributes.Caters",
         "attributes.RestaurantsAttire",
 
-        # Business subfeatures expanded from multi-label / nested fields.
-        # These are structured descriptors, created before the review merge.
         *[
             col for col in dataset.columns
             if is_engineered_business_feature(col)
         ],
 
-        # User-level variables
         "user_review_count",
         "user_average_stars",
         "user_fans",
@@ -1671,7 +1539,6 @@ def select_model_columns(dataset: pd.DataFrame) -> pd.DataFrame:
         "user_funny",
         "user_cool",
 
-        # Restaurant activity features
         "checkin_count",
         "tip_count",
         "tip_compliment_count",
@@ -1726,8 +1593,6 @@ def process_data(tables: dict) -> pd.DataFrame:
     tip = tables["tip"]
     photo = tables["photo"]
 
-    # prepare_core_tables renames columns (e.g. stars -> review_stars) and adds
-    # the target. Renames are not feature add/drops, so we only flag the target.
     business, reviews, users = prepare_core_tables(
         business=business,
         reviews=reviews,
@@ -1740,8 +1605,6 @@ def process_data(tables: dict) -> pd.DataFrame:
     report_feature_change("add_business_subfeatures [business]",
                           business_before, business.columns)
 
-    # First feature drop: keep only the columns we need from each table, before
-    # the merge copies them across millions of rows.
     tables_before_selection = {
         "business": business,
         "reviews": reviews,
@@ -1764,8 +1627,6 @@ def process_data(tables: dict) -> pd.DataFrame:
 
     review_sample = sample_reviews(reviews)
 
-    # The check-in / tip / photo tables are collapsed into per-business count
-    # features here; they get attached to the dataset at the merge step below.
     checkin_features = create_checkin_features(checkin)
     tip_features = create_tip_features(tip)
     photo_features = create_photo_features(photo)
@@ -1780,7 +1641,6 @@ def process_data(tables: dict) -> pd.DataFrame:
         tip_features=tip_features,
         photo_features=photo_features,
     )
-    # Merge ADDS the business, user, and count columns onto each review row.
     report_feature_change("merge_tables", review_cols, dataset.columns)
 
     print("\nCleaning values...")
@@ -1830,26 +1690,18 @@ def process_data(tables: dict) -> pd.DataFrame:
     return model_data
 
 
-# ================================================================================
-# 2b. WEATHER ENRICHMENT  (download + merge NOAA daily weather)
-# ================================================================================
 
-# ---------------------------------------------------------------------------
-# NOAA download configuration
-# ---------------------------------------------------------------------------
 
 NOAA_ENDPOINT = "https://www.ncei.noaa.gov/access/services/data/v1"
 
-# Requested NOAA data types (metric units). TOBS is intentionally not requested.
 WEATHER_VARIABLES = [
-    "PRCP",  # precipitation
-    "SNOW",  # snowfall
-    "SNWD",  # snow depth
-    "TMAX",  # maximum temperature
-    "TMIN",  # minimum temperature
+    "PRCP",
+    "SNOW",
+    "SNWD",
+    "TMAX",
+    "TMIN",
 ]
 
-# NOAA raw column -> project column.
 RENAME_MAP = {
     "DATE": "review_date",
     "PRCP": "weather_prcp",
@@ -1859,7 +1711,6 @@ RENAME_MAP = {
     "TMIN": "weather_tmin",
 }
 
-# One representative station per city/metro area.
 TOP_CITIES = [
     {"city": "Philadelphia", "state": "PA", "station": "USW00013739"},
     {"city": "New Orleans", "state": "LA", "station": "USW00012916"},
@@ -1889,9 +1740,6 @@ TOP_CITIES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Download + clean
-# ---------------------------------------------------------------------------
 
 def get_review_date_range(df: pd.DataFrame) -> tuple[str, str]:
     """
@@ -2048,9 +1896,6 @@ def get_clean_weather(yelp: pd.DataFrame, refresh: bool = False) -> pd.DataFrame
     return weather_clean
 
 
-# ---------------------------------------------------------------------------
-# Merge
-# ---------------------------------------------------------------------------
 
 def prepare_merge_keys(
     yelp: pd.DataFrame,
@@ -2065,8 +1910,6 @@ def prepare_merge_keys(
             frame["city"].astype("string").str.strip().str.replace(r"\s+", " ", regex=True)
         )
         frame["state"] = frame["state"].astype("string").str.strip().str.upper()
-        # Normalise to midnight datetime64 so the merge key dtype stays
-        # consistent with the Yelp dataset (avoids an object-dtype date column).
         frame["review_date"] = pd.to_datetime(
             frame["review_date"], errors="coerce"
         ).dt.normalize()
@@ -2128,9 +1971,6 @@ def save_weather_outputs(enriched: pd.DataFrame) -> None:
     print(f"\nSaved final dataset: {DATASET_PKL}")
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
 
 def build_weather_enriched(yelp: pd.DataFrame, refresh: bool = False) -> pd.DataFrame:
     """Download/merge NOAA weather into the review-level dataset and save it."""
@@ -2150,25 +1990,14 @@ def build_weather_enriched(yelp: pd.DataFrame, refresh: bool = False) -> pd.Data
     save_weather_outputs(enriched)
     return enriched
 
-# ================================================================================
-# 3. EXPLORATORY DATA ANALYSIS
-# ================================================================================
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
 
 EDA_OUTPUT_DIR = PROCESSED_DATA_DIR / "eda_outputs"
 PLOT_OUTPUT_DIR = EDA_OUTPUT_DIR / "plots"
 PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# review_stars is shown for context only: the target is derived from it, so it
-# (and the other LEAKAGE_COLS) are excluded from the modelling correlation matrix.
 
-# Fallback raw numeric variables for the descriptive-statistics table. In the
-# normal EDA flow, the numeric summary is produced after the correlation/VIF
-# workflow and uses the reduced numeric EDA feature set instead.
 KEY_NUMERIC_COLS = [
     "review_text_length",
     "business_stars",
@@ -2189,17 +2018,10 @@ KEY_NUMERIC_COLS = [
     "weather_temp_range",
 ]
 
-# |r| at or above this flags two predictors as redundant (multicollinearity).
 CORR_THRESHOLD = 0.8
 
-# VIF above this threshold is treated as severe multicollinearity and removed
-# from the final EDA correlation plot. This is diagnostic only; the modelling
-# feature-selection logic below remains the single source of truth for models.
 VIF_THRESHOLD = 10.0
 
-# Binary indicators are candidates for closer review when they are both rare
-# and have almost no marginal relationship with satisfaction. This is a
-# conservative EDA flag, not a tuning step on the test set.
 EDA_DUMMY_LOW_PREVALENCE_PERCENT = 1.0
 EDA_DUMMY_LOW_ABS_TARGET_CORR = 0.01
 
@@ -2242,9 +2064,6 @@ EDA_INTERPRETABILITY_DROP_PRIORITY = {
 }
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
 
 def available_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
     return [col for col in columns if col in df.columns]
@@ -2267,16 +2086,15 @@ def plot_bar(
     filename: str,
     rotate_labels: bool = True,
     hline: float | None = None,
+    colors: list[str] | None = None,
 ) -> None:
     if table.empty:
         return
 
     plt.figure(figsize=(11, 6))
-    plt.bar(table[x_col].astype(str), table[y_col])
+    plt.bar(table[x_col].astype(str), table[y_col], color=colors)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
-    # Optional reference line (e.g. the overall satisfaction rate) so the reader
-    # can see which groups sit above or below the baseline at a glance.
     if hline is not None:
         plt.axhline(hline, color="0.35", linestyle="--", linewidth=1.2)
     if rotate_labels:
@@ -2284,9 +2102,6 @@ def plot_bar(
     save_current_plot(filename)
 
 
-# =============================================================================
-# Descriptive statistics
-# =============================================================================
 
 def run_dataset_overview(df: pd.DataFrame) -> None:
     """Print whole-dataset EDA context without pretending every column is a predictor."""
@@ -2496,9 +2311,6 @@ def run_categorical_summary(df: pd.DataFrame) -> None:
     )
 
 
-# =============================================================================
-# Skewness: raw vs log-transformed
-# =============================================================================
 
 def run_skewness_comparison(df: pd.DataFrame) -> None:
     """
@@ -2532,9 +2344,6 @@ def run_skewness_comparison(df: pd.DataFrame) -> None:
     )
 
 
-# =============================================================================
-# Target analysis
-# =============================================================================
 
 def run_target_analysis(df: pd.DataFrame) -> None:
     print_section("Target analysis")
@@ -2587,11 +2396,7 @@ def run_target_analysis(df: pd.DataFrame) -> None:
         )
 
 
-# =============================================================================
-# Satisfaction by group (business-facing descriptive analysis)
-# =============================================================================
 
-# Calendar helpers for the timing breakdowns.
 WEEKDAY_NAMES = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTH_TO_SEASON = {
@@ -2602,20 +2407,12 @@ MONTH_TO_SEASON = {
 }
 SEASON_ORDER = ["Winter", "Spring", "Summer", "Autumn"]
 
-# Continuous variables compared between satisfied and dissatisfied reviews. These
-# are shown descriptively (means by class); leakage columns are deliberately not
-# listed here. Weather is included so the paper can answer directly whether
-# weather differs between satisfied and dissatisfied reviews.
 SATISFACTION_COMPARE_COLS = [
-    # Weather (continuous)
     "weather_tmax", "weather_tmin", "weather_temp_range",
     "weather_prcp", "weather_snow", "weather_snow_depth",
-    # Engagement / business activity
     "business_review_count", "checkin_count", "tip_count",
     "tip_compliment_count", "photo_count",
-    # User history
     "user_review_count", "user_fans", "user_useful",
-    # Structured review characteristics
     "review_text_length", "review_year",
 ]
 
@@ -2727,6 +2524,7 @@ def run_satisfaction_by_group(df: pd.DataFrame) -> None:
             by_user, "user_experience", "satisfaction_rate_percent",
             title="", xlabel="User review-count bucket", ylabel="Satisfaction rate (%)",
             filename="satisfaction_by_user_experience.png", rotate_labels=False, hline=overall,
+            colors=qualitative_palette("Pastel1", len(by_user)),
         )
 
     weather_flags = [c for c in ["is_rainy", "is_snowy", "is_hot", "is_cold"] if c in df.columns]
@@ -2846,9 +2644,6 @@ def run_satisfied_vs_dissatisfied_comparison(df: pd.DataFrame) -> None:
         )
 
 
-# =============================================================================
-# Correlation matrix (relevance + multicollinearity)
-# =============================================================================
 
 def empty_multicollinearity_diagnostics() -> pd.DataFrame:
     """Return the standard schema for EDA multicollinearity drop diagnostics."""
@@ -3236,12 +3031,9 @@ def plot_reduced_correlation_matrix(
     ax.set_xticklabels(corr.columns, rotation=90, ha="center", va="bottom", fontsize=7)
     ax.tick_params(axis="y", left=False, labelleft=False)
     ax.xaxis.tick_top()
-    # About 4 mm of padding keeps the top labels close but prevents overlap.
     ax.tick_params(axis="x", top=False, labeltop=True, bottom=False, labelbottom=False, pad=11)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    # Use the masked half of the matrix as label space so the row labels sit
-    # next to the diagonal instead of on the outside axis.
     for idx, label in enumerate(corr.index):
         ax.text(
             idx - 0.62,
@@ -3478,8 +3270,6 @@ def run_eda_correlation_workflows(
         "Variables excluded because of leakage rule",
         max_rows=max(80, len(screening_drops)),
     )
-    # Clean remove: physically drop the leakage / ID / date / post-review
-    # variables now, so every later EDA step works on the surviving frame only.
     eda_df = drop_screened_eda_exclusions(df, screening_drops)
 
     final_continuous, continuous_drops = run_reduced_correlation_vif_workflow(
@@ -3495,10 +3285,6 @@ def run_eda_correlation_workflows(
         plot_filename="binary_correlation_matrix.png",
     )
 
-    # Clean remove (continued): physically drop the multicollinearity / VIF
-    # casualties from the working frame too. After this, the surviving eda_df IS
-    # exactly the reduced EDA feature set that the summaries below describe --
-    # nothing is flagged as excluded yet left lingering in the data.
     kept_numeric = set(final_continuous.columns) | set(final_binary.columns)
     candidate_numeric = set(continuous_candidates.columns) | set(binary_candidates.columns)
     multicollinearity_dropped = sorted(candidate_numeric - kept_numeric)
@@ -3506,9 +3292,6 @@ def run_eda_correlation_workflows(
         columns=[c for c in multicollinearity_dropped if c in eda_df.columns]
     )
 
-    # One consolidated audit of every variable removed from the EDA feature set,
-    # across all three rules (leakage screening, pairwise correlation, VIF), so
-    # the paper has a single place documenting exactly what was dropped and why.
     consolidated = pd.concat(
         [screening_drops, continuous_drops, binary_drops],
         ignore_index=True,
@@ -3523,6 +3306,7 @@ def run_eda_correlation_workflows(
         "Complete EDA exclusion audit (all variables removed from the feature set)",
         max_rows=max(120, len(consolidated)),
     )
+    report_dropped_variable_table("EDA numeric screening", df, eda_df.columns)
     print(
         f"\nFinal EDA feature set after clean removal: {eda_df.shape[1]:,} columns "
         f"({len(final_continuous.columns):,} continuous, "
@@ -3532,9 +3316,6 @@ def run_eda_correlation_workflows(
     return eda_df, final_continuous, final_binary
 
 
-# =============================================================================
-# Main
-# =============================================================================
 
 def eda_main(df: pd.DataFrame) -> None:
     print_section("Exploratory data analysis")
@@ -3553,9 +3334,6 @@ def eda_main(df: pd.DataFrame) -> None:
         columns=final_numeric_eda.columns.tolist(),
         title="Numeric summary (final reduced continuous/count EDA feature set)",
     )
-    # Skewness evidence lives here in the EDA (raw vs log1p) to justify the log
-    # transform applied later at the modelling stage. It runs on the surviving
-    # reduced feature set only, so it covers exactly the counts that get logged.
     run_skewness_comparison(eda_feature_df)
     run_binary_summary(
         eda_feature_df,
@@ -3567,15 +3345,9 @@ def eda_main(df: pd.DataFrame) -> None:
     print(f"Plots saved to: {PLOT_OUTPUT_DIR}")
 
 
-# ================================================================================
-# 4. FEATURE ENGINEERING  (leakage-safe feature set + preprocessing)
-# ================================================================================
 
 DATE_COL = "review_date"
 
-# Variables observed only after the review is written. They are useful for EDA
-# or optional robustness checks, but excluded from the main structured model by
-# default because they are not available before/at the satisfaction outcome.
 POST_REVIEW_COLS = [
     "review_text_length",
     "log_review_text_length",
@@ -3587,49 +3359,18 @@ POST_REVIEW_COLS = [
     "log_review_cool",
 ]
 
-# Features removed after EDA because of multicollinearity / VIF. Names are given
-# in their pre-log form; the drop step below removes whichever form (raw or
-# log_) actually exists after the log-and-replace.
-# Features removed at the EDA-to-modelling transition. This list must stay in
-# agreement with what the EDA's correlation/VIF screening actually removes,
-# otherwise the EDA reports a reduced feature set that the models never use --
-# and the paper's EDA and modelling sections contradict each other.
-#
-# Two provenances, deliberately kept separate:
-#
-#   (a) STRUCTURAL. Justified by an exact algebraic identity, not by a VIF
-#       threshold. The iterative VIF loop only partially detects these: once it
-#       removes two photo sub-types the remaining ones fall below the threshold
-#       and it stops, even though photo_count is still their exact sum.
-#   (b) EDA SCREENING. The correlation/VIF casualties the EDA actually reports.
-#       Recomputed from run_eda_correlation_workflows; if the screening changes,
-#       update this list to match.
 DROP_FOR_REDUNDANCY = [
-    # -- (a) structural: exact identities -----------------------------------
-    # photo_count is the exact sum of its five sub-types (VIF -> infinity).
     "photo_food", "photo_drink", "photo_menu", "photo_inside", "photo_outside",
-    # weather_temp_range = weather_tmax - weather_tmin (exact).
     "weather_tmin",
 
-    # -- (b) EDA correlation/VIF casualties ---------------------------------
-    # User votes: severe multicollinearity (VIF >> 10). Keep user_useful.
     "user_funny", "user_cool",
-    # Business activity: moderate multicollinearity. Keep business_review_count.
     "checkin_count", "tip_count",
-    # Opening-hours block. The weekly and weekend totals are sums of the daily
-    # durations, and the individual weekday durations are near-collinear with
-    # one another. Keep monday/tuesday/friday/sunday and hours_open_days_count.
     "hours_duration_wednesday", "hours_duration_thursday", "hours_duration_saturday",
     "hours_total_weekly_open_hours", "hours_weekend_open_hours",
-    # Binary casualties: hours_weekend_open is implied by the saturday/sunday
-    # open flags; category_nightlife overlaps category_bars.
     "hours_open_thursday", "hours_open_saturday", "hours_weekend_open",
     "category_nightlife",
 ]
 
-# Features we don't use at all, removed BEFORE the EDA so they don't appear in
-# the EDA tables. weather_available is the weather missing-indicator: correct to
-# include in principle, but it carries ~0 signal here, so we choose not to use it.
 DROP_LOW_SIGNAL = ["weather_available"]
 
 
@@ -3734,8 +3475,6 @@ def select_features(
     }
     drop = set().union(*drop_groups.values())
 
-    # 'station' is the NOAA station id added by the weather merge: an
-    # identifier and a near-duplicate of the high-cardinality 'city' we drop.
     drop.add("station")
     drop_groups["weather station identifier"] = {"station"}
 
@@ -3747,7 +3486,6 @@ def select_features(
         drop.add("city")
         drop_groups["high-cardinality location"] = {"city"}
 
-    # For every raw count with a log_ version, keep the log and drop the raw.
     raw_with_log_twin = set()
     for col in list(df.columns):
         if f"log_{col}" in df.columns:
@@ -3780,10 +3518,6 @@ def select_features(
 
     X = df[feature_cols].copy()
 
-    # Weekday and month are cyclical / non-monotonic: treat them as categorical
-    # so they are one-hot / natively encoded rather than read as ordinal numbers
-    # (e.g. Sunday=6 is not "greater than" Monday=0). review_year stays numeric
-    # because a monotonic time trend there is meaningful.
     for col in ["review_weekday", "review_month"]:
         if col in X.columns:
             X[col] = X[col].astype("category")
@@ -3888,222 +3622,91 @@ def build_preprocessor(
     return _assemble_preprocessor(X, encoder, scale_numeric)
 
 
-# ================================================================================
-# 5. MODELLING  (train candidate models)
-# ================================================================================
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 OUTPUT_DIR = PROCESSED_DATA_DIR / "model_outputs"
 PLOT_DIR = OUTPUT_DIR / "plots"
 PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# Several required models (SVM, KNN, the neural net) cannot train on millions
-# of rows. For a fair, tractable comparison every model is fit on the same
-# stratified subsample of this size (set to None to use the full dataset, only
-# sensible if you drop SVM/KNN). 100k preserves the class balance and is ample
-# for ranking algorithms.
 MODEL_SAMPLE_N = 100_000
 
 
-# Light cross-validation for stability. Runs on a stratified subsample.
 DO_CV = True
 CV_FOLDS = 3
 CV_SUBSAMPLE = 300_000
 
-# Hyperparameter search across every tunable model, and a permutation-importance
-# plot across all models. Both are extra work, so they run on subsamples; set the
-# DO_ flags to False to skip. With DO_GRID_SEARCH off, the models keep the
-# documented default hyperparameters hard-coded in build_models().
 DO_GRID_SEARCH = True
 GRID_SAMPLE = 30_000
 DO_FEATURE_IMPORTANCE = True
-PERM_SAMPLE = 3_000      # rows used for permutation importance (KNN is the bottleneck)
+PERM_SAMPLE = 3_000
 PERM_REPEATS = 5
 
-# Fit the un-tuned (default) models on the training set as a reference pass, so
-# the report can quantify what the hyperparameter search was actually worth.
-# Costs one extra fit of every model; set False to skip.
 DO_UNTUNED_COMPARISON = True
 
-# ---------------------------------------------------------------------------
-# Top-k feature-subset curve (parsimony / feature-ceiling evidence)
-# ---------------------------------------------------------------------------
-# Refits the best model on its k most important features, for a range of k, and
-# scores each subset on the held-out test set. If a small k recovers nearly the
-# full-model Gini, then (a) the signal concentrates in a nameable handful of
-# features -- the managerial short-list -- and (b) the remaining features add
-# almost nothing, which is the feature ceiling stated as a measurement rather
-# than an assertion.
-#
-# LEAKAGE RULE: the feature ranking is computed with permutation importance on
-# held-out CROSS-VALIDATION FOLDS OF THE TRAINING SET, never on the test set.
-# Ranking features by their test-set importance and then reporting test-set
-# performance would be circular: the test set would have chosen the features.
-# The test set is used only to score each already-chosen subset.
-#
-# The curve is DESCRIPTIVE. Do not pick a k from it and then report that k's
-# test score as the headline model -- that would reintroduce selection on test.
-# Feature-group ablation: remove one block of features at a time, refit, and
-# measure the Gini it costs. This is what answers REQUIREMENTS.md 17's
-# subquestions 2-5 ("do engagement / user / timing / weather features add
-# predictive value?"), which permutation importance cannot answer because
-# correlated features inside a block mask one another.
 DO_GROUP_ABLATION = True
 
-# ---------------------------------------------------------------------------
-# Learning curve (the data-volume half of the feature-ceiling claim)
-# ---------------------------------------------------------------------------
-# The model comparison runs on a 100k subsample because KNN, the linear SVM and
-# the MLP cannot scale. That leaves "more data would not help" asserted rather
-# than measured. The learning curve measures it: fit the two models that DO scale
-# cheaply on training sets of increasing size and score each on one fixed held-out
-# test set. If the curve is flat past ~100k, the ceiling is not a data-volume
-# ceiling. It uses its own split of the full ~2.9M-row dataset and is a separate
-# experiment from the model comparison -- say so when reporting it.
 DO_LEARNING_CURVE = True
 LEARNING_CURVE_MODELS = ("hist_gradient_boosting", "logistic_regression")
 LEARNING_CURVE_SIZES = (10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000)
 LEARNING_CURVE_TEST_SIZE = 250_000
 
 DO_TOPK_CURVE = True
-TOPK_VALUES = (5, 10, 25, 50, None)   # None = all features (the full model)
-TOPK_PERM_SAMPLE = 5_000              # held-out rows per fold used for importance
-TOPK_PERM_REPEATS = 3                 # shuffles per feature per fold
-TOPK_IMPORTANCE_PLOT_N = 15           # features shown in the importance figure
+TOPK_VALUES = (5, 10, 25, 50, None)
+TOPK_PERM_SAMPLE = 5_000
+TOPK_PERM_REPEATS = 3
+TOPK_IMPORTANCE_PLOT_N = 15
 
-# The model whose importance ranking sorts the comparison figure and whose bar sits
-# on top of each pair. NOTE this is gradient boosting, not the best model: the
-# figure therefore shows GRADIENT BOOSTING's top-N features in ITS order, which is
-# not identical to the random forest's (they share 8 of their top 10). If the report
-# tabulates the random forest's ranking, say which model orders the figure.
 IMPORTANCE_PLOT_PRIMARY = "hist_gradient_boosting"
 
-# Orange and olive: entries 2 and 3 of the 8-colour Pastel1 ramp, matching the EDA
-# figures. Hard-coded rather than indexed out of qualitative_palette() because the
-# matplotlib fallback ramp (used when colorspace is absent) returns different hues,
-# and a figure's identity must not depend on an optional dependency.
 IMPORTANCE_PLOT_COLOURS = ("#F2CDB2", "#D4D8A7")
 
-# Features shown in the two-model comparison figure. Fewer than the single-model
-# figure: two bars per feature need the vertical room.
 IMPORTANCE_COMPARISON_TOP_N = 12
 
-# Exact pixel size of the comparison figure. Achieved by sizing the canvas as
-# px / dpi and saving WITHOUT bbox_inches="tight", which would re-crop the figure
-# after rendering and silently change the output size. tight_layout() reserves the
-# margins instead, so the y-labels still fit.
-#
-# The height is FIXED, not derived from the number of rows: changing
-# IMPORTANCE_COMPARISON_TOP_N therefore changes the bar density, not the canvas.
-# Raise the height if a larger top-N ever makes the bars too thin to read.
 IMPORTANCE_PLOT_WIDTH_PX = 2800
 IMPORTANCE_PLOT_HEIGHT_PX = 2000
 IMPORTANCE_PLOT_DPI = 300
 
-# Shared by the top-k curve, the feature-group ablation, and the pairwise model
-# comparison. Every variant is scored on the SAME test rows, so their errors are
-# correlated and the difference between two of them is estimated far more precisely
-# than either Gini is on its own. Comparing them against a single-model standard
-# error -- or against a cross-validation standard deviation, which measures fold-to-
-# fold stability rather than the uncertainty of a difference -- would overstate that
-# uncertainty. We resample the test rows instead (a paired bootstrap), recompute
-# every variant's Gini on each resample, and take percentile intervals of both the
-# level and the difference from a reference.
 PAIRED_BOOTSTRAP_RESAMPLES = 2_000
 
-# "Which model is best" is a claim about a difference, and differences need
-# intervals. run_model_comparison_bootstrap reports which models are statistically
-# indistinguishable from the best; run_importance_agreement then checks whether
-# those models rank the features the same way. If they disagree, reporting one
-# model's importances as "the" importances is unjustified.
 DO_MODEL_BOOTSTRAP = True
 DO_IMPORTANCE_AGREEMENT = True
 
 
-# ---------------------------------------------------------------------------
-# Hyperparameter search space (one grid per model)
-# ---------------------------------------------------------------------------
-# Searched with GridSearchCV on the TRAINING set only, scored by ROC-AUC. The
-# inner StratifiedKFold folds are the validation mechanism: each configuration is
-# scored on held-out folds, so no separate validation split is needed and the
-# test set is never involved.
-#
-# Models absent from this dict, or mapped to an empty grid, are left at their
-# build_models() defaults. Parameter names are pipeline-scoped: "model__C" is C
-# on the final estimator, and "model__estimator__max_depth" reaches the base tree
-# nested inside BaggingClassifier.
-#
-# Notes on what is deliberately *not* searched:
-#   - svm_linear keeps dual=False, which forces loss="squared_hinge", so C is
-#     genuinely the only knob it has.
-#   - logistic_regression uses the lbfgs solver, which supports L2 only. L1
-#     (sparse coefficients) would require solver="saga", which converges slowly
-#     on a one-hot matrix this wide; not worth the runtime here.
-#   - naive_bayes has exactly one hyperparameter.
-#   - hist_gradient_boosting does not tune max_iter: early stopping (set in
-#     build_models) already decides the iteration count, so max_iter is a cap.
-# Grid ranges: an earlier run had six of nine winners sitting on a grid boundary,
-# almost all pointing the same way (toward more regularisation / simpler models).
-# A boundary winner means the search wanted to keep going and was cut off, so the
-# reported optimum is an artefact of the range. Every grid below now brackets the
-# previous winner with values on BOTH sides. run_grid_search flags any remaining
-# boundary hit; if one appears, widen that axis again rather than ignoring it.
 PARAM_GRIDS: dict[str, dict] = {
     "logistic_regression": {
-        # Previous winner C=0.01 was the smallest offered: it wanted more penalty.
         "model__C": [0.0001, 0.001, 0.01, 0.1, 1.0],
     },
     "svm_linear": {
-        # Same story as the logit: C=0.01 was the floor of the old grid.
         "model__C": [0.0001, 0.001, 0.01, 0.1, 1.0],
     },
     "knn": {
-        # n_neighbors=400 was the ceiling of the previous grid; it wanted more
-        # smoothing still. `weights` is deliberately NOT tuned (see build_models).
         "model__n_neighbors": [100, 200, 400, 800, 1600],
     },
     "naive_bayes": {
-        # Bin count controls how finely each continuous feature is discretised:
-        # the bias/variance knob of a nonparametric density.
         "pre__num_cont__bin__n_bins": [5, 10, 20],
-        # Laplace/Lidstone smoothing (R's fL).
         "model__alpha": [0.01, 0.1, 1.0, 10.0],
     },
     "neural_net": {
-        # Previous winner: alpha=1e-3 (ceiling) with the widest single layer.
         "model__hidden_layer_sizes": [(64,), (128,), (256,), (64, 32)],
         "model__alpha": [1e-4, 1e-3, 1e-2, 1e-1],
     },
     "decision_tree": {
-        # Previous winner sat at BOTH boundaries: shallowest depth, largest leaf.
         "model__max_depth": [4, 6, 8, 12],
         "model__min_samples_leaf": [50, 100, 200],
         "model__criterion": ["gini", "entropy"],
     },
     "bagging": {
-        # The old winner wanted more complexity, but that was measured on an
-        # unweighted bagging model (the class_weight bug). Bracket both ways.
         "model__estimator__max_depth": [12, 16, 20],
         "model__estimator__min_samples_leaf": [20, 50],
-        # max_features < 1.0 subsamples columns per base tree: this is precisely
-        # what separates plain bagging from a random forest.
         "model__max_features": [0.5, 1.0],
     },
     "random_forest": {
-        # Previous winner: max_depth=12 (floor), min_samples_leaf=20 (floor),
-        # max_features=0.5 (ceiling). Extend all three.
         "model__max_depth": [8, 12, 16],
         "model__min_samples_leaf": [10, 20, 50],
-        # After depth, max_features is the most consequential forest knob: it
-        # controls how decorrelated the trees are.
         "model__max_features": ["sqrt", 0.5, 0.8],
     },
     "hist_gradient_boosting": {
-        # Previous winner sat on the regularising boundary of all four axes.
         "model__learning_rate": [0.01, 0.05, 0.1],
         "model__max_leaf_nodes": [15, 31, 63],
         "model__l2_regularization": [0.0, 1.0, 10.0],
@@ -4112,9 +3715,6 @@ PARAM_GRIDS: dict[str, dict] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Tree-specific preprocessor (compact, no one-hot blow-up)
-# ---------------------------------------------------------------------------
 
 def build_tree_preprocessor(X: pd.DataFrame):
     """
@@ -4126,7 +3726,7 @@ def build_tree_preprocessor(X: pd.DataFrame):
     """
     encoder = OrdinalEncoder(
         handle_unknown="use_encoded_value",
-        unknown_value=np.nan,          # unseen categories -> treated as missing
+        unknown_value=np.nan,
         encoded_missing_value=np.nan,
     )
     preprocessor, numeric, categorical = _assemble_preprocessor(
@@ -4151,9 +3751,6 @@ def build_ordinal_preprocessor(X: pd.DataFrame) -> tuple[ColumnTransformer, list
     return _assemble_preprocessor(X, encoder, scale_numeric=False)
 
 
-# ---------------------------------------------------------------------------
-# Model definitions
-# ---------------------------------------------------------------------------
 
 def build_nb_preprocessor(X: pd.DataFrame, n_bins: int = 10) -> ColumnTransformer:
     """Distribution-free preprocessor for Naive Bayes: everything becomes binary.
@@ -4241,8 +3838,6 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "svm_linear": Pipeline([
             ("pre", scaled_pre),
-            # Linear SVM (kernel SVM is infeasible at this scale). dual=False is
-            # the recommended setting when n_samples > n_features.
             ("model", LinearSVC(
                 C=1.0,
                 class_weight="balanced",
@@ -4252,22 +3847,12 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "knn": Pipeline([
             ("pre", scaled_pre),
-            # weights="uniform" is fixed, not a tunable. With weights="distance" a
-            # training point is its own neighbour at distance 0, so it takes
-            # infinite weight and the model reproduces the training labels exactly
-            # (train ROC-AUC = 1.000) -- a definitional artefact, not overfitting,
-            # that makes the training row uninterpretable. Measured cost of
-            # forcing uniform: 0.0175 GINI on the test set (0.2721 -> 0.2546).
             ("model", KNeighborsClassifier(
                 n_neighbors=25, weights="uniform", n_jobs=-1,
             )),
         ]),
         "naive_bayes": Pipeline([
-            # Bernoulli NB over quantile-binned features: no parametric density
-            # assumption anywhere. See build_nb_preprocessor.
             ("pre", build_nb_preprocessor(X_train)),
-            # alpha is Laplace/Lidstone smoothing -- the same knob R's naiveBayes
-            # calls fL. GaussianNB had no equivalent, only var_smoothing.
             ("model", BernoulliNB(alpha=1.0)),
         ]),
         "neural_net": Pipeline([
@@ -4281,8 +3866,6 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "decision_tree": Pipeline([
             ("pre", ordinal_pre),
-            # min_samples_leaf raised to curb the overfitting seen in the
-            # train-vs-test gap (a single tree memorises small leaves otherwise).
             ("model", DecisionTreeClassifier(
                 max_depth=12,
                 min_samples_leaf=50,
@@ -4292,15 +3875,6 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "bagging": Pipeline([
             ("pre", ordinal_pre),
-            # Default bagging uses unpruned trees -> train ROC-AUC = 1.0. Bound
-            # the base tree's depth and leaf size so it generalises instead of
-            # memorising.
-            # BaggingClassifier itself has no class_weight, but its base tree
-            # does, and setting it there is what balances the ensemble. Without
-            # it bagging silently optimises raw accuracy on a 70/30 target: it
-            # scored 0.717 accuracy with recall_dissat = 0.15, i.e. it mostly
-            # predicted "satisfied". Keep this in step with decision_tree and
-            # random_forest, which set class_weight directly.
             ("model", BaggingClassifier(
                 estimator=DecisionTreeClassifier(
                     max_depth=16,
@@ -4314,8 +3888,6 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "random_forest": Pipeline([
             ("pre", ordinal_pre),
-            # max_depth + min_samples_leaf added for the same reason: the
-            # unconstrained forest hit train ROC-AUC = 1.0 (severe overfitting).
             ("model", RandomForestClassifier(
                 n_estimators=200,
                 max_depth=16,
@@ -4327,13 +3899,6 @@ def build_models(X_train: pd.DataFrame) -> dict:
         ]),
         "hist_gradient_boosting": Pipeline([
             ("pre", hgb_pre),
-            # early_stopping is set explicitly rather than left at 'auto'. 'auto'
-            # resolves to True whenever n_samples > 10_000, which is always the
-            # case here, so it was already silently on: max_iter acted as a mere
-            # upper bound. Making it explicit means max_iter is a stated cap and
-            # the grid tunes the parameters that actually bind (learning rate,
-            # leaf count, L2). The internal validation slice is carved out of the
-            # training fold only, so it introduces no test-set leakage.
             ("model", HistGradientBoostingClassifier(
                 categorical_features=cat_mask,
                 class_weight="balanced",
@@ -4347,9 +3912,6 @@ def build_models(X_train: pd.DataFrame) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
 
 def top_decile_lift(y_true, y_score, fraction: float = 0.1, pos_label: int = 1) -> float:
     """Lift in the top-scored fraction (default top decile): the rate of
@@ -4386,9 +3948,6 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
     actionable) dissatisfied minority.
     """
     metrics = {
-        # Plain accuracy is deliberately NOT computed: with a 69.71% positive rate
-        # it is uninterpretable (an always-predict-satisfied rule scores 0.6971)
-        # and it inverts the true model ranking. Balanced accuracy replaces it.
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
@@ -4399,18 +3958,8 @@ def compute_metrics(y_true, y_pred, y_score) -> dict:
         "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
     }
     if y_score is not None:
-        # ROC-AUC is computed but never reported: gini = 2*AUC - 1 is a strictly
-        # increasing rescaling of it, so Gini carries exactly the same information
-        # and ranks models identically. Gini is the reported and ranked metric.
         roc = roc_auc_score(y_true, y_score)
         metrics["gini"] = 2 * roc - 1
-        # PR-AUC for the dissatisfied minority. Unlike ROC-AUC, average precision
-        # is NOT invariant to the class prior: its no-skill baseline equals the
-        # rate of the class being scored. For satisfied (~70%) that floor is
-        # 0.697, which flatters the model; for dissatisfied (~30%) it is 0.303.
-        # Only the minority version is computed -- the satisfied-class PR-AUC is
-        # misleading under this imbalance and is deliberately not produced.
-        # y_score ranks the satisfied class, so it is negated to rank dissatisfied.
         y_dissat = (np.asarray(y_true) == 0).astype(int)
         metrics["pr_auc_dissat"] = average_precision_score(y_dissat, -np.asarray(y_score))
         metrics["top_decile_lift"] = top_decile_lift(y_true, y_score, pos_label=1)
@@ -4433,9 +3982,6 @@ def get_scores(model, X) -> np.ndarray | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 
 def fit_and_time(models, X_train, y_train) -> tuple[dict, dict]:
     """Fit each model on the training set, recording wall-clock fit seconds.
@@ -4467,35 +4013,11 @@ def evaluate_fitted(fitted, X, y, seconds: dict | None = None) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(SELECTION_METRIC, ascending=False).reset_index(drop=True)
 
 
-# Column layout of the reported evaluation tables, mapping our internal metric
-# names onto the conventional report names. "specificity" is recall on the
-# dissatisfied (negative) class; it is the same quantity as recall_dissat, named
-# the way the evaluation table convention expects.
-# Metric used to rank models, sort the CV table, pick the best model, and choose
-# the top-3 for permutation importance. Single source of truth so the project
-# cannot rank on one metric and report another.
-#
-# Gini on purpose. Gini = 2*ROC_AUC - 1 inherits ROC-AUC's invariance to the class
-# prior (no-skill = 0 at any imbalance), so it stays comparable across subsamples
-# and cannot be gamed by predicting the majority class. Accuracy is prior-corrupted
-# and is not computed at all; PR-AUC is prior-dependent and is reported, not ranked on.
 SELECTION_METRIC = "gini"
 SELECTION_METRIC_CV = f"{SELECTION_METRIC}_mean"
 
-# scikit-learn has no "gini" scorer string. Because gini is a strictly increasing
-# function of ROC-AUC, maximising roc_auc maximises gini exactly, so this is the
-# implementation of SELECTION_METRIC inside GridSearchCV / cross_validate /
-# permutation_importance. ROC-AUC never leaves this module as a reported number.
 GRID_SCORING = "roc_auc"
 
-# Reported table layout. Deliberately imbalance-aware:
-#   - Balanced accuracy replaces accuracy, which a 70/30 prior corrupts.
-#   - PR-AUC is the DISSATISFIED-class average precision (baseline 0.303), not the
-#     satisfied-class one (baseline 0.697, which flatters every model).
-#   - GINI carries the ROC-AUC information and is SELECTION_METRIC. Gini =
-#     2*ROC_AUC - 1 is a strictly increasing rescaling, so it ranks models
-#     identically and ROC-AUC is never reported anywhere. If a reader wants it,
-#     ROC_AUC = (GINI + 1) / 2 recovers it exactly.
 REPORT_COLUMNS = {
     "model": "Model",
     "balanced_accuracy": "Balanced Acc.",
@@ -4509,13 +4031,8 @@ REPORT_COLUMNS = {
     "fit_seconds": "Time (s)",
 }
 
-# Columns where a smaller value is better (used by the conditional formatting).
 REPORT_LOWER_IS_BETTER = {"Time (s)"}
 
-# Fixed row order and display names for the evaluation tables. The order is
-# deliberately NOT by score: the three tables (un-tuned/train, tuned/train,
-# tuned/test) must list models in the same sequence so a reader can compare one
-# model across tables by looking at the same row.
 MODEL_DISPLAY_ORDER = [
     "logistic_regression",
     "naive_bayes",
@@ -4560,13 +4077,9 @@ def print_report_table(table: pd.DataFrame, title: str) -> None:
         print(table.to_string(index=False))
 
 
-# Conditional-formatting poles for the rendered tables. Teal (better) and amber
-# (worse), NOT red/green: simulated under deuteranopia, red/green separate by only
-# dE 10.4 (below the dE >= 12 legibility floor), while teal/amber hold dE 62.5.
-# Colour is redundant emphasis here -- every value is also printed in its cell.
-TABLE_GOOD_RGB = (0.059, 0.463, 0.431)   # #0f766e teal
-TABLE_BAD_RGB = (0.706, 0.325, 0.035)    # #b45309 amber
-TABLE_MAX_TINT = 0.42                    # keeps black text at >= 8:1 contrast
+TABLE_GOOD_RGB = (0.059, 0.463, 0.431)
+TABLE_BAD_RGB = (0.706, 0.325, 0.035)
+TABLE_MAX_TINT = 0.42
 
 
 def _cell_colour(series: pd.Series, value: float, lower_is_better: bool):
@@ -4602,15 +4115,12 @@ def save_report_table_png(
         for _, row in table.iterrows()
     ]
 
-    # Explicit column widths. Matplotlib's default equal widths clip both the long
-    # model names and the wider headers ("Balanced Acc.", "Specificity"), so each
-    # column is sized from its widest text rather than shared out evenly.
     model_w = 0.11 * max(len(str(v)) for v in table["Model"]) + 0.55
     metric_w = [max(0.95, 0.082 * len(c) + 0.36) for c in metrics]
     total_w = model_w + sum(metric_w)
     col_widths = [model_w / total_w] + [w / total_w for w in metric_w]
 
-    n_rows = len(table) + 1                       # + header
+    n_rows = len(table) + 1
     fig, ax = plt.subplots(figsize=(total_w, 0.34 * n_rows + 0.55))
     ax.axis("off")
     ax.set_title(title, loc="left", fontsize=12, fontweight="bold", pad=10)
@@ -4620,7 +4130,7 @@ def save_report_table_png(
         colLabels=["Model"] + metrics,
         cellLoc="right",
         colWidths=col_widths,
-        bbox=[0, 0, 1, 1],                        # fill the axes; no dead space
+        bbox=[0, 0, 1, 1],
     )
     mpl_table.auto_set_font_size(False)
     mpl_table.set_fontsize(9)
@@ -4628,14 +4138,14 @@ def save_report_table_png(
     for (r, c), cell in mpl_table.get_celld().items():
         cell.set_edgecolor("#d8dde2")
         cell.set_linewidth(0.5)
-        if r == 0:                                     # header
+        if r == 0:
             cell.set_facecolor("#eef2f6")
             cell.set_text_props(fontweight="bold", color="#3d454d")
             if c == 0:
                 cell.set_text_props(ha="left")
             continue
         model = table.iloc[r - 1]["Model"]
-        if c == 0:                                     # model name column
+        if c == 0:
             cell.set_text_props(ha="left", fontweight="medium")
             cell.set_facecolor("#ffffff")
             continue
@@ -4683,8 +4193,6 @@ def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
         Xs, ys = X_train, y_train
 
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    # No "accuracy" (prior-corrupted) and no "average_precision" (that is the
-    # satisfied-class PR-AUC, whose no-skill floor is the 0.697 positive rate).
     scoring = ["balanced_accuracy", "f1", GRID_SCORING]
 
     rows = []
@@ -4695,8 +4203,6 @@ def run_cross_validation(models, X_train, y_train) -> pd.DataFrame:
         for metric in scoring:
             values = scores[f"test_{metric}"]
             if metric == GRID_SCORING:
-                # Report gini, not roc_auc. gini = 2*auc - 1 is affine, so the mean
-                # maps directly and the standard deviation scales by 2.
                 row[f"{SELECTION_METRIC}_mean"] = 2 * values.mean() - 1
                 row[f"{SELECTION_METRIC}_std"] = 2 * values.std()
             else:
@@ -4752,9 +4258,6 @@ def find_boundary_hits(grid: dict, best_params: dict) -> list[str]:
     return hits
 
 
-# Hyperparameters deliberately held FIXED rather than searched. Reported next to
-# the tuned ones so the paper can state each model's full specification, and so a
-# reader can see that e.g. class_weight was a design decision, not a search result.
 FIXED_HYPERPARAMETERS: dict[str, dict] = {
     "logistic_regression": {
         "solver": "lbfgs", "penalty": "l2 (lbfgs supports no other)",
@@ -4948,7 +4451,7 @@ def run_grid_search(X_train, y_train) -> dict[str, dict]:
         search = GridSearchCV(pipes[name], grid, scoring=GRID_SCORING, cv=cv, n_jobs=-1)
         search.fit(Xs, ys)
         best_params[name] = search.best_params_
-        best_gini = 2 * search.best_score_ - 1     # scorer maximises AUC == maximises gini
+        best_gini = 2 * search.best_score_ - 1
         print(f"  best CV GINI: {best_gini:.4f}")
         print(f"  best params:  {search.best_params_}")
 
@@ -4970,14 +4473,11 @@ def run_grid_search(X_train, y_train) -> dict[str, dict]:
     if not all_hits:
         print("\nNo boundary hits: every tuned value is interior to its grid.")
 
-    # Exported so the chosen hyperparameters can go straight into the appendix.
     tuned = pd.DataFrame(rows).sort_values("best_cv_gini", ascending=False)
     path = OUTPUT_DIR / "hyperparameter_search.csv"
     tuned.to_csv(path, index=False)
     print(f"\nSaved: {path}")
 
-    # The methods-section table: every hyperparameter, its search space, and the
-    # winning value, with fixed (unsearched) parameters listed alongside.
     print_hyperparameter_table(best_params)
 
     return best_params
@@ -5052,7 +4552,7 @@ def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
         offset = (i - n_models / 2) * height + height / 2
         plt.barh(y + offset, imp_df[mdl].to_numpy(), height, label=mdl, color=colors[i])
     plt.yticks(y, top)
-    plt.gca().invert_yaxis()                      # most important feature on top
+    plt.gca().invert_yaxis()
     plt.xlabel("Permutation importance (drop in ROC-AUC)")
     plt.legend(title="model")
     plt.tight_layout()
@@ -5062,9 +4562,6 @@ def plot_feature_importance(fitted, X_test, y_test, top_models) -> None:
     print(f"  saved {path}")
 
 
-# ---------------------------------------------------------------------------
-# Top-k feature-subset curve
-# ---------------------------------------------------------------------------
 
 def cv_permutation_importance(model, X_train, y_train) -> pd.Series:
     """Fold-averaged permutation importance, measured on held-out training folds.
@@ -5121,10 +4618,6 @@ def paired_bootstrap_gini(
     n = len(y)
     keys = list(scores_by_key)
 
-    # The reported point estimate is the OBSERVED difference on the full test set.
-    # The bootstrap supplies the interval, not the estimate: the mean of the
-    # resampled deltas is a slightly different quantity and would disagree with the
-    # Gini values printed elsewhere in the same table.
     observed = {k: 2 * roc_auc_score(y, s) - 1 for k, s in scores_by_key.items()}
 
     levels = {k: [] for k in keys}
@@ -5132,17 +4625,13 @@ def paired_bootstrap_gini(
     for _ in range(PAIRED_BOOTSTRAP_RESAMPLES):
         idx = rng.integers(0, n, n)
         y_b = y[idx]
-        if y_b.min() == y_b.max():      # degenerate resample, no positive/negative
+        if y_b.min() == y_b.max():
             continue
         gini_b = {k: 2 * roc_auc_score(y_b, scores_by_key[k][idx]) - 1 for k in keys}
         for k in keys:
             levels[k].append(gini_b[k])
             deltas[k].append(gini_b[k] - gini_b[reference_key])
 
-    # Every non-reference variant is compared against the reference, so we make
-    # (len(keys) - 1) simultaneous comparisons. Testing each at 95% inflates the
-    # family-wise error rate well above 5%. The Bonferroni interval below widens
-    # each one so that the FAMILY of comparisons jointly holds at 95%.
     n_comparisons = max(len(keys) - 1, 1)
     alpha = 0.05
     bonf = 100 * alpha / (2 * n_comparisons)
@@ -5158,7 +4647,6 @@ def paired_bootstrap_gini(
             "delta_vs_full": observed[k] - observed[reference_key],
             "delta_vs_full_lo": d_lo, "delta_vs_full_hi": d_hi,
             "delta_bonf_lo": b_lo, "delta_bonf_hi": b_hi,
-            # "Significant" = the interval excludes zero.
             "differs_from_full": bool(d_lo > 0 or d_hi < 0),
             "differs_from_full_bonf": bool(b_lo > 0 or b_hi < 0),
         })
@@ -5176,7 +4664,7 @@ def plot_permutation_importance(
     the top three models. The two figures must not be confused; this one is the
     ranking that drives the top-k curve, and it never touches the test set.
     """
-    top = importance.head(top_n)[::-1]              # smallest at the bottom of the axes
+    top = importance.head(top_n)[::-1]
     blocks = [_group_membership(f) or "other" for f in top.index]
 
     unique_blocks = sorted(set(blocks))
@@ -5219,9 +4707,8 @@ def plot_importance_comparison(
     caption must state that importances are a ranking, not an additive decomposition
     of Gini, and that magnitudes are estimator-specific.
     """
-    # Primary model first: it orders the features and sits on top of each pair.
     ordered_models = sorted(model_names, key=lambda name: name != IMPORTANCE_PLOT_PRIMARY)
-    order = agreement[ordered_models[0]].nlargest(top_n).index[::-1]   # best at top
+    order = agreement[ordered_models[0]].nlargest(top_n).index[::-1]
     top = agreement.loc[order]
 
     colours = IMPORTANCE_PLOT_COLOURS
@@ -5233,8 +4720,6 @@ def plot_importance_comparison(
         IMPORTANCE_PLOT_HEIGHT_PX / IMPORTANCE_PLOT_DPI,
     ))
     for i, name in enumerate(ordered_models):
-        # Primary model on TOP of each group, so the visual order of the bars
-        # matches the reading order of the legend.
         offset = ((len(ordered_models) - 1) / 2 - i) * height
         ax.barh(positions + offset, top[name].to_numpy(), height,
                 color=colours[i % len(colours)],
@@ -5248,8 +4733,6 @@ def plot_importance_comparison(
     apply_simple_plot_style(ax)
     fig.tight_layout()
 
-    # No bbox_inches="tight" here: it re-crops after rendering, so the saved width
-    # would not be the requested IMPORTANCE_PLOT_WIDTH_PX.
     path = PLOT_DIR / "permutation_importance_comparison.png"
     fig.savefig(path, dpi=IMPORTANCE_PLOT_DPI, facecolor="white")
     plt.close(fig)
@@ -5259,15 +4742,6 @@ def plot_importance_comparison(
 
 def plot_topk_curve(curve: pd.DataFrame, model_name: str) -> Path:
     """Test-set Gini as a function of feature-set size."""
-    # Levels only. The paired differences and their Bonferroni intervals are printed
-    # to the console and saved to topk_feature_curve.csv; they are NOT drawn here.
-    #
-    # Consequence to carry into the caption: this panel alone shows a rise to k=50
-    # and a dip at k=97, which invites the conclusion that 50 features beat the full
-    # model. It does not. The paired difference at k=50 is +0.0017 with a
-    # Bonferroni-adjusted 95% interval of [-0.0027, +0.0063], which contains zero.
-    # Quote the intervals in the caption, or the figure argues for something the
-    # data do not support.
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
     ax.plot(curve["n_features"], curve["gini"], marker="o", linewidth=2, color="#0f766e")
@@ -5311,8 +4785,6 @@ def run_topk_curve(
             reference.set_params(**best_params[model_name])
         importance = cv_permutation_importance(reference, X_train, y_train)
     else:
-        # Already computed by run_importance_agreement with the identical method;
-        # recomputing it would cost a full permutation pass for the same numbers.
         print("Reusing the ranking computed for the importance-agreement check.\n")
         importance = importance.sort_values(ascending=False)
 
@@ -5345,7 +4817,7 @@ def run_topk_curve(
     curve["gini_pct_of_full"] = 100 * curve["gini"] / full_gini
 
     print(f"\nPaired bootstrap ({PAIRED_BOOTSTRAP_RESAMPLES:,} resamples of the test rows) ...")
-    full_key = max(scores_by_k)          # the full-feature model is the reference
+    full_key = max(scores_by_k)
     ci = paired_bootstrap_gini(y_test, scores_by_k, reference_key=full_key)
     curve = curve.merge(ci, on="n_features", how="left")
 
@@ -5376,18 +4848,6 @@ def run_topk_curve(
     return curve
 
 
-# ---------------------------------------------------------------------------
-# Feature-group ablation
-# ---------------------------------------------------------------------------
-# REQUIREMENTS.md 17 asks, as subquestions, whether particular BLOCKS of features
-# add predictive value: engagement indicators (2), user characteristics (3),
-# review timing (4), external/weather data (5). Permutation importance cannot
-# answer these, because features inside a correlated block mask one another --
-# shuffle weather_prcp alone and is_rainy still carries the rain signal, so both
-# look unimportant while the block as a whole may matter.
-#
-# The ablation removes a whole block at once, refits, and measures the drop with
-# the same paired bootstrap the top-k curve uses.
 
 def _group_membership(column: str) -> str | None:
     """Assign a modelling column to a feature block (None = ungrouped)."""
@@ -5399,9 +4859,6 @@ def _group_membership(column: str) -> str | None:
         return "user characteristics"
     if column in ("review_year", "review_month", "review_weekday"):
         return "review timing"
-    # attributes.* plus the sub-dictionaries flattened out of them during
-    # ingestion (Ambience -> ambience_*, Parking -> parking_*, GoodForMeal ->
-    # meal_*), and is_open, which is a business-level status flag.
     if (column.startswith("attributes.") or column.startswith("ambience_")
             or column.startswith("parking_") or column.startswith("meal_")
             or column == "is_open"):
@@ -5486,10 +4943,9 @@ def run_feature_group_ablation(
     table = (
         pd.DataFrame(rows)
         .merge(ci, on="removed_block", how="left")
-        .sort_values("delta_vs_full")           # most damaging removal first
+        .sort_values("delta_vs_full")
         .reset_index(drop=True)
     )
-    # A block "adds value" when removing it significantly LOWERS Gini.
     table["block_adds_value"] = table["delta_bonf_hi"] < 0
 
     print("\n" + "=" * 118)
@@ -5513,9 +4969,6 @@ def run_feature_group_ablation(
     return table
 
 
-# ---------------------------------------------------------------------------
-# Pairwise model comparison
-# ---------------------------------------------------------------------------
 
 def run_model_comparison_bootstrap(fitted: dict, results: pd.DataFrame, X_test, y_test):
     """Paired bootstrap of every tuned model against the best one.
@@ -5538,7 +4991,7 @@ def run_model_comparison_bootstrap(fitted: dict, results: pd.DataFrame, X_test, 
         if y_score is not None:
             scores[name] = np.asarray(y_score)
 
-    best = results.iloc[0]["model"]      # results is sorted by SELECTION_METRIC
+    best = results.iloc[0]["model"]
     print(f"Reference (best on test by {SELECTION_METRIC.upper()}): {best}")
     print(f"{PAIRED_BOOTSTRAP_RESAMPLES:,} resamples of {len(y_test):,} test rows, "
           f"{len(scores) - 1} simultaneous comparisons (Bonferroni-adjusted).\n")
@@ -5580,9 +5033,6 @@ def run_model_comparison_bootstrap(fitted: dict, results: pd.DataFrame, X_test, 
     return table, indistinguishable
 
 
-# ---------------------------------------------------------------------------
-# Feature-importance agreement across the indistinguishable models
-# ---------------------------------------------------------------------------
 
 def run_importance_agreement(
     model_names: list[str], best_params: dict, X_train, y_train,
@@ -5620,7 +5070,6 @@ def run_importance_agreement(
         print("=" * 100)
         for i, first in enumerate(model_names):
             for second in model_names[i + 1:]:
-                # Spearman via pandas: no scipy dependency for one correlation.
                 rho = table[first].corr(table[second], method="spearman")
                 top_a = set(table[first].nlargest(10).index)
                 top_b = set(table[second].nlargest(10).index)
@@ -5650,9 +5099,6 @@ def run_importance_agreement(
     return table
 
 
-# ---------------------------------------------------------------------------
-# Learning curve
-# ---------------------------------------------------------------------------
 
 def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
     """Test-set Gini as a function of TRAINING-SET SIZE, on the full dataset.
@@ -5671,7 +5117,7 @@ def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
         X_full, y_full,
         test_size=LEARNING_CURVE_TEST_SIZE,
         stratify=y_full,
-        random_state=RANDOM_STATE + 1,      # its own split; a separate experiment
+        random_state=RANDOM_STATE + 1,
     )
     print(f"pool {len(X_pool):,} rows | fixed test {len(X_lc_test):,} rows "
           f"| positive rate {y_full.mean():.4f}")
@@ -5723,14 +5169,9 @@ def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
     print(f"\nSaved: {OUTPUT_DIR / 'learning_curve.csv'}")
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    # The 80k reference line (the model-comparison training size) is deliberately
-    # not drawn: the house style carries no reference lines. State it in the caption
-    # instead -- it is what makes the curve's message land.
     palette = dict(zip(LEARNING_CURVE_MODELS, IMPORTANCE_PLOT_COLOURS))
     for name in LEARNING_CURVE_MODELS:
         block = curve[curve["model"] == name]
-        # Slightly heavier than the default: the pastel hues that read well as bar
-        # fills are faint as thin lines.
         ax.plot(block["n_train"], block["gini"], marker="o", linewidth=2.6,
                 markersize=6, label=MODEL_DISPLAY_NAMES.get(name, name),
                 color=palette.get(name))
@@ -5747,9 +5188,6 @@ def run_learning_curve(X_full, y_full, best_params: dict) -> pd.DataFrame:
     return curve
 
 
-# ---------------------------------------------------------------------------
-# Coefficient table (direction of effect)
-# ---------------------------------------------------------------------------
 
 def export_logistic_coefficients(fitted_logit, top_n: int = 20) -> pd.DataFrame:
     """Signed coefficients and odds ratios for the tuned logistic regression.
@@ -5793,16 +5231,11 @@ def export_logistic_coefficients(fitted_logit, top_n: int = 20) -> pd.DataFrame:
     return table
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def models_main(df: pd.DataFrame) -> None:
     print("Building feature set...")
     X_full, y_full = select_features(df)
 
-    # The learning curve needs the whole dataset, so keep a reference before the
-    # model-comparison subsample replaces X.
     X, y = X_full, y_full
     X, y = stratified_subsample(X, y, MODEL_SAMPLE_N)
     if MODEL_SAMPLE_N is not None:
@@ -5812,10 +5245,6 @@ def models_main(df: pd.DataFrame) -> None:
     print(f"Train: {len(X_train):,} rows | Test: {len(X_test):,} rows "
           f"| positive rate {y.mean() * 100:.2f}%")
 
-    # No-information reference. There is no DummyClassifier row in the comparison
-    # table, so state explicitly what a model with no skill scores on each reported
-    # metric. This is the class-imbalance check REQUIREMENTS.md 14 asks for.
-    # PR-AUC's floor is the DISSATISFIED rate, because that is the class it scores.
     print(f"No-information reference (always predict 'satisfied'): "
           f"Balanced Acc. 0.5000, GINI 0.0000, PR-AUC {1 - y.mean():.4f}, TDL 1.0000.")
     print(f"Positive (satisfied) rate {y.mean():.4f}. Plain accuracy is not reported: "
@@ -5823,10 +5252,6 @@ def models_main(df: pd.DataFrame) -> None:
 
     models = build_models(X_train)
 
-    # ---- Un-tuned reference pass, on the training set only. ----
-    # Fits the build_models() defaults so the report can show what tuning was
-    # actually worth. It never touches the test set: the point of comparison is
-    # tuned-vs-untuned on identical training data.
     untuned_test = None
     if DO_UNTUNED_COMPARISON:
         print("\nFitting the UN-TUNED (default) models for the tuning comparison...")
@@ -5841,10 +5266,6 @@ def models_main(df: pd.DataFrame) -> None:
             untuned_table, "Un-tuned models - training data", "eval_untuned_train.png",
         )
 
-        # Un-tuned models on the TEST set. Without this the effect of tuning cannot
-        # be measured at all: comparing the two TRAINING tables is misleading,
-        # because tuning selects stronger regularisation and therefore *lowers*
-        # training-set scores by design. Only held-out data shows what it bought.
         untuned_test = evaluate_fitted(untuned_fitted, X_test, y_test, untuned_seconds)
         untuned_test_table = to_report_table(untuned_test)
         print_report_table(untuned_test_table, "EVALUATION: UN-TUNED MODELS on HELD-OUT TEST data")
@@ -5853,21 +5274,8 @@ def models_main(df: pd.DataFrame) -> None:
         save_report_table_png(
             untuned_test_table, "Un-tuned models - held-out test data", "eval_untuned_test.png",
         )
-        del untuned_fitted   # free the duplicate ensembles before refitting tuned
+        del untuned_fitted
 
-    # ---- Training-phase work first: nothing here touches the test set. ----
-    # Order is deliberate: tune -> cross-validate -> test.
-    #   1. Grid search picks each model's hyperparameters using inner CV folds on
-    #      the training set. Those folds ARE the validation step; no separate
-    #      validation split is needed.
-    #   2. Cross-validation then reports fold-to-fold stability (mean +/- std) of
-    #      the *tuned* models, which is what the paper actually reports. Running
-    #      it before tuning would describe models we never use.
-    #   3. Only afterwards is the held-out test set opened, exactly once.
-    # Defined up-front: the stages below are individually toggleable, and the
-    # top-k curve consumes both. With their stage off, an empty dict means "no
-    # tuned parameters" (models keep build_models defaults) and cv_results stays
-    # None, which run_topk_curve's caller handles explicitly.
     best_params: dict[str, dict] = {}
     cv_results = None
 
@@ -5885,13 +5293,9 @@ def models_main(df: pd.DataFrame) -> None:
             print(cv_results.to_string(index=False))
         cv_results.to_csv(OUTPUT_DIR / "model_comparison_cv.csv", index=False)
 
-    # ---- Fit on train; report training-set performance. ----
     print("\nFitting the TUNED models and evaluating on training and held-out test sets...")
     results, fitted, train_results, _ = evaluate_holdout(models, X_train, X_test, y_train, y_test)
 
-    # No degenerate rows: KNN is pinned to weights="uniform", so no model can
-    # reproduce its own training set by construction. save_report_table_png still
-    # accepts degenerate_rows in case a future model needs it.
     tuned_train_table = to_report_table(train_results)
     print_report_table(tuned_train_table, "EVALUATION: TUNED MODELS on TRAINING data")
     train_results.to_csv(OUTPUT_DIR / "model_comparison_train.csv", index=False)
@@ -5900,7 +5304,6 @@ def models_main(df: pd.DataFrame) -> None:
         tuned_train_table, "Tuned models - training data", "eval_tuned_train.png",
     )
 
-    # ---- Held-out test set: the final measurement, touched last. ----
     tuned_test_table = to_report_table(results)
     print_report_table(tuned_test_table, "EVALUATION: TUNED MODELS on HELD-OUT TEST data")
     print("\nCompare against the training table above: scores far higher on train")
@@ -5912,14 +5315,10 @@ def models_main(df: pd.DataFrame) -> None:
         tuned_test_table, "Tuned models - held-out test data", "eval_tuned_test.png",
     )
 
-    # ---- Interpretation of the final model(s) on the test set. ----
     best_name = results.iloc[0]["model"]
-    # SELECTION_METRIC is GINI: invariant to the class prior (no-skill = 0), so a
-    # model that mostly predicts the majority class cannot win on it.
     print(f"\nBest model by {SELECTION_METRIC.upper()} (invariant to class imbalance): {best_name}")
     plot_confusion(fitted[best_name], X_test, y_test, best_name)
 
-    # ---- What did tuning actually buy? Both tables are on the SAME test set. ----
     if untuned_test is not None:
         delta = (
             results.set_index("model")["gini"] - untuned_test.set_index("model")["gini"]
@@ -5933,26 +5332,18 @@ def models_main(df: pd.DataFrame) -> None:
     if DO_FEATURE_IMPORTANCE:
         plot_feature_importance(fitted, X_test, y_test, results["model"].head(3).tolist())
 
-    # Direction of effect. Permutation importance is unsigned, so the managerial
-    # section needs signed coefficients from the (interpretable) linear model.
     if "logistic_regression" in fitted:
         export_logistic_coefficients(fitted["logistic_regression"])
 
-    # ---- Which models are genuinely tied for best? ----
     tied_models = [results.iloc[0]["model"]]
     if DO_MODEL_BOOTSTRAP:
         _, tied_models = run_model_comparison_bootstrap(fitted, results, X_test, y_test)
 
-    # ---- Do the tied models rank the features the same way? ----
     agreement = None
     if DO_IMPORTANCE_AGREEMENT:
         agreement = run_importance_agreement(tied_models, best_params, X_train, y_train)
 
     if DO_TOPK_CURVE:
-        # Pick the model for the curve from CROSS-VALIDATION, not from the test
-        # table. Selecting it by test performance and then reporting test-set
-        # curves for it would let the test set choose the model as well as score
-        # it. cv_results is computed on the training set only.
         if DO_CV:
             topk_model = cv_results.iloc[0]["model"]
             print(f"\nCurve model chosen by cross-validated {SELECTION_METRIC}: {topk_model}")
@@ -5961,9 +5352,6 @@ def models_main(df: pd.DataFrame) -> None:
             print(f"\nWARNING: DO_CV is off, so the curve model ({topk_model}) was")
             print("chosen using the test set. Enable DO_CV for a clean selection.")
 
-        # Reuse the ranking if the agreement check already produced it for this
-        # model. It may not have: the curve model is the CV-best, while the
-        # agreement check covers the models tied with the TEST-best.
         precomputed = None
         if agreement is not None and topk_model in agreement.columns:
             precomputed = agreement[topk_model]
@@ -5971,8 +5359,6 @@ def models_main(df: pd.DataFrame) -> None:
                        importance=precomputed)
 
     if DO_GROUP_ABLATION:
-        # Same model as the curve, chosen from cross-validation rather than the
-        # test table, for the same reason.
         ablation_model = cv_results.iloc[0]["model"] if DO_CV else results.iloc[0]["model"]
         run_feature_group_ablation(
             ablation_model, best_params, X_train, y_train, X_test, y_test)
@@ -5982,9 +5368,6 @@ def models_main(df: pd.DataFrame) -> None:
 
     print("\nModel comparison completed.")
 
-# ================================================================================
-# 6. RESULTS & COMMAND-LINE ENTRY POINTS
-# ================================================================================
 
 def main() -> None:
     """Run the project as one linear pipeline, gated by the stage toggles.
@@ -6004,11 +5387,10 @@ def main() -> None:
     the other two off) or the modelling section (RUN_MODELING on, the other two
     off) without repeating the expensive ingestion stage each time.
     """
-    # -- Stages 1-2b: ingestion, preprocessing, NOAA weather enrichment -------
     if RUN_INGESTION:
-        tables = load_raw_data()                      # 1. import raw data
-        processed = process_data(tables)              # 2. clean / merge / sample
-        enriched = build_weather_enriched(processed)  # 2b. + NOAA weather (saved)
+        tables = load_raw_data()
+        processed = process_data(tables)
+        enriched = build_weather_enriched(processed)
     else:
         if not DATASET_PKL.exists():
             raise FileNotFoundError(
@@ -6018,27 +5400,17 @@ def main() -> None:
             )
         print(f"Loading cached enriched dataset: {DATASET_PKL}")
         enriched = pd.read_pickle(DATASET_PKL)
-        # Caches built before the u'x'/'x' fix still carry the duplicate attribute
-        # levels. The normaliser is idempotent, so repairing them here is a no-op
-        # on a cache written by the current ingestion code.
         enriched = normalize_attribute_levels(enriched)
 
-    # Remove features we won't use at all (e.g. the weather_available missing-
-    # indicator) before EDA, so they don't appear in the EDA tables either.
     enriched = drop_low_signal_features(enriched)
 
-    # -- Stage 3: EDA on the raw (untransformed) enriched data ----------------
     if RUN_EDA:
         eda_main(enriched)
 
-    # -- Stages 4-6: EDA-informed transition, modelling, and results ----------
     model_df = None
     if RUN_MODELING:
-        # EDA-informed transition: drop identifiers + the redundant features
-        # from the correlation/VIF analysis, then log-and-replace the skewed
-        # counts. The log transform deliberately happens here, after EDA.
-        model_df = build_model_dataset(enriched)      # 4. build modelling dataset
-        models_main(model_df)                         # 5-6. features + train + results
+        model_df = build_model_dataset(enriched)
+        models_main(model_df)
 
     print("\nDone.")
     print(f"Enriched dataset:  {enriched.shape[0]:,} rows x {enriched.shape[1]} columns")
