@@ -1,0 +1,6 @@
+SELECT j::text AS json FROM public.business WHERE j ->> 'categories' ILIKE '%Restaurants%'; 
+SELECT r.j::text AS json FROM public.review r JOIN public.business b ON r.j ->> 'business_id' = b.j ->> 'business_id' WHERE b.j ->> 'categories' ILIKE '%Restaurants%'; 
+SELECT DISTINCT u.j::text AS json FROM public.users u JOIN public.review r ON u.j ->> 'user_id' = r.j ->> 'user_id' JOIN public.business b ON r.j ->> 'business_id' = b.j ->> 'business_id' WHERE b.j ->> 'categories' ILIKE '%Restaurants%'; 
+SELECT c.j::text AS json FROM public.checkin c JOIN public.business b ON c.j ->> 'business_id' = b.j ->> 'business_id' WHERE b.j ->> 'categories' ILIKE '%Restaurants%'; 
+SELECT t.j::text AS json FROM public.tip t JOIN public.business b ON t.j ->> 'business_id' = b.j ->> 'business_id' WHERE b.j ->> 'categories' ILIKE '%Restaurants%'; 
+SELECT p.j::text AS json FROM public.photo p JOIN public.business b ON p.j ->> 'business_id' = b.j ->> 'business_id' WHERE b.j ->> 'categories' ILIKE '%Restaurants%';
